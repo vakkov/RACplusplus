@@ -61,10 +61,10 @@ void remove_secondary_clusters(std::vector<std::pair<int, int> >& merges, std::v
 
 //-----------------------Distance Calculations-------------------------
 //Calculate pairwise cosines between two matrices
-//Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b);
+Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b);
 
-void pairwise_cosine_inplace(const Eigen::MatrixXd& A,
-    const Eigen::MatrixXd& B);
+// void pairwise_cosine_inplace(const Eigen::MatrixXd& A,
+//     const Eigen::MatrixXd& B);
 
 //Calculate pairwise euclidean between two matrices
 Eigen::MatrixXd pairwise_euclidean(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b);

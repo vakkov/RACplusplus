@@ -434,6 +434,55 @@ void calculate_initial_dissimilarities(
     }
 }
 
+// works in blocks, so we never allocate the full N×N distance matrix
+void calculate_initial_dissimilarities_batched(
+        Eigen::MatrixXd&                base_arr,
+        std::vector<Cluster*>&          clusters,
+        double                          max_merge_distance,
+        int                             batch_size,
+        const std::string&              distance_metric)
+{
+    const int N = static_cast<int>(clusters.size());
+
+    for (int col0 = 0; col0 < N; col0 += batch_size) {
+        const int col1   = std::min(col0 + batch_size, N);
+        const int width  = col1 - col0;
+
+        // slice [rows × width] from the data matrix
+        Eigen::MatrixXd block = base_arr.block(
+                0,               /*row 0*/
+                col0,            /*first column*/
+                base_arr.rows(), /*all rows*/
+                width);          /*#columns*/
+
+        Eigen::MatrixXd dist;
+        if (distance_metric == "cosine") {
+            dist = pairwise_cosine(base_arr, block).array();
+        } else {
+            dist = pairwise_euclidean(base_arr, block).array();
+        }
+
+        for (int local = 0; local < width; ++local) {
+            const int idx = col0 + local;          // real column index
+            Cluster*   c  = clusters[idx];
+
+            double min_d = std::numeric_limits<double>::infinity();
+            int    nn    = -1;
+
+            for (int i = 0; i < N; ++i) {
+                if (i == idx) continue;
+                const double d = dist(i, local);
+                if (d < max_merge_distance) {
+                    c->neighbor_distances.emplace_back(i, d);
+                    if (d < min_d) { min_d = d; nn = i; }
+                }
+            }
+            c->nn = nn;
+        }
+    }
+}
+    
+
 //-----------------------End Distance Calculations-------------------------
 
 //-----------------------Merging Functions-----------------------------------
@@ -468,7 +517,7 @@ double get_cluster_distances(
             recalculate_idxs.push_back(idx);
         } else {
             rolling_dist += main_cluster->dissimilarities[idx];
-            ++no_dists;
+        +no_dists;
         }
     }
 
@@ -524,7 +573,7 @@ std::pair<std::vector<int>, std::vector<int>> split_neighbors(
                 if (merging_array[id] == 0) {
                     static_neighbors.push_back(id);
                 }
-                ++merging_array[id];
+            +merging_array[id];
             }
         }
     }
@@ -1222,7 +1271,7 @@ void RAC_i(
 
 void RAC(
     Eigen::MatrixXd& base_arr,
-    std::vector<Cluster*> clusters,
+    std::vector<Cluster*>& clusters,
     double max_merge_distance,
     int no_processors = 0,
     std::string distance_metric = "euclidean"
@@ -1233,22 +1282,40 @@ void RAC(
         Cluster* cluster = new Cluster(i);
         clusters.push_back(cluster);
     }
-    Eigen::MatrixXd distance_arr;
+    // Eigen::MatrixXd distance_arr;
 
-    auto start = std::chrono::high_resolution_clock::now();
-    distance_arr = calculate_initial_dissimilarities(base_arr, clusters, max_merge_distance, distance_metric);
-    auto end = std::chrono::high_resolution_clock::now();
+    // auto start = std::chrono::high_resolution_clock::now();
+    // distance_arr = calculate_initial_dissimilarities(base_arr, clusters, max_merge_distance, distance_metric);
+    // auto end = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+    // std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
 
-    RAC_i(clusters, max_merge_distance, no_processors, distance_arr);
+    // RAC_i(clusters, max_merge_distance, no_processors, distance_arr);
+
+    // pick a block size –  N/10 is a good default
+    const int BATCHSIZE =
+        std::max(1, static_cast<int>(clusters.size() / 10));
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    calculate_initial_dissimilarities_batched(
+            base_arr, clusters,
+            max_merge_distance, BATCHSIZE, distance_metric);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    std::cout << "Initial dissimilarities (batched): "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t1 - t0).count()
+            << " ms" << std::endl;
+
+    // use the RAC_i overload that works directly from base_arr
+    RAC_i(clusters, max_merge_distance, base_arr, no_processors);
 
     //return clusters;
 }
 
 void RAC(
     Eigen::MatrixXd& base_arr,
-    std::vector<Cluster*> clusters,
+    std::vector<Cluster*>& clusters,
     double max_merge_distance,
     Eigen::SparseMatrix<bool>& connectivity,
     int batch_size = 0,
