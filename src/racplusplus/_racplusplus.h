@@ -61,7 +61,10 @@ void remove_secondary_clusters(std::vector<std::pair<int, int> >& merges, std::v
 
 //-----------------------Distance Calculations-------------------------
 //Calculate pairwise cosines between two matrices
-Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b);
+//Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b);
+
+void pairwise_cosine_inplace(const Eigen::MatrixXd& A,
+    const Eigen::MatrixXd& B);
 
 //Calculate pairwise euclidean between two matrices
 Eigen::MatrixXd pairwise_euclidean(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b);
@@ -212,19 +215,19 @@ void RAC_i(
     double max_merge_distance, 
     const int NO_PROCESSORS);
 
-std::vector<Cluster*> RAC(
-    Eigen::MatrixXd& base_arr,
-    double max_merge_distance,
-    int no_processors,
-    std::string distance_metric);
+// std::vector<Cluster*> RAC(
+//     Eigen::MatrixXd& base_arr,
+//     double max_merge_distance,
+//     int no_processors,
+//     std::string distance_metric);
 
-std::vector<Cluster*> RAC(
-    Eigen::MatrixXd& base_arr,
-    double max_merge_distance,
-    Eigen::SparseMatrix<bool>& connectivity,
-    int batch_size,
-    int no_processors,
-    std::string distance_metric);
+// std::vector<Cluster*> RAC(
+//     Eigen::MatrixXd& base_arr,
+//     double max_merge_distance,
+//     Eigen::SparseMatrix<bool>& connectivity,
+//     int batch_size,
+//     int no_processors,
+//     std::string distance_metric);
 
 std::vector<int> RAC(
     Eigen::MatrixXd& base_arr,
@@ -234,6 +237,7 @@ std::vector<int> RAC(
     int no_processors,
     std::string distance_metric);
 
+#ifndef RACPP_BUILDING_LIB_ONLY
 py::array RAC_py(
     Eigen::MatrixXd base_arr,
     double max_merge_distance,
@@ -249,5 +253,6 @@ py::array _pairwise_euclidean_distance_py(
 py::array _pairwise_cosine_distance_py(
     Eigen::MatrixXd base_arr,
     Eigen::MatrixXd query_arr);
+#endif
 //--------------------------------------End RAC Functions--------------------------------------
 
