@@ -214,9 +214,16 @@ void remove_secondary_clusters(std::vector<std::pair<int, int> >& merges, std::v
 
 //-----------------------Distance Calculations-------------------------
 //Calculate pairwise cosines between two matrices
-Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b) {
-    return Eigen::MatrixXd::Ones(array_a.cols(), array_b.cols()) - (array_a.transpose() * array_b);
+// Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b) {
+//     return Eigen::MatrixXd::Ones(array_a.cols(), array_b.cols()) - (array_a.transpose() * array_b);
+// }
+
+Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B) {
+    Eigen::MatrixXd D = A.transpose() * B;   // one N×N buffer
+    D = (-D).array() + 1.0;                  // reuse the same buffer
+    return D;
 }
+
 
 //Calculate pairwise euclidean between two matrices
 Eigen::MatrixXd pairwise_euclidean(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b) {
@@ -341,9 +348,9 @@ Eigen::MatrixXd calculate_initial_dissimilarities(
 
     Eigen::MatrixXd distance_mat;
     if (distance_metric == "cosine") {
-        distance_mat = pairwise_cosine(base_arr, base_arr).array();
+        distance_mat = pairwise_cosine(base_arr, base_arr); //.array();
     } else {
-        distance_mat = pairwise_euclidean(base_arr, base_arr).array();
+        distance_mat = pairwise_euclidean(base_arr, base_arr); //.array();
     }
 
     size_t clusterSize = clusters.size();
