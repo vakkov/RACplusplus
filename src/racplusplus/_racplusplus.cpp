@@ -5,7 +5,6 @@
 #include <pybind11/stl.h>
 namespace py = pybind11;
 #endif
-
 #include <array>
 #include <tuple>
 #include <unordered_map>
@@ -68,8 +67,6 @@ int main() {
     int no_processors = 0;
     //actually run test
     std::vector<int> labels = RAC(test, max_merge_distance, nullptr, batch_size, no_processors, "cosine");
-    //free the test matrix from heap
-    test.resize(0,0);
 
     // Output duration
     std::cout << std::accumulate(UPDATE_NEIGHBOR_DURATIONS.begin(), UPDATE_NEIGHBOR_DURATIONS.end(), 0.0) / 1000 << std::endl;
@@ -88,7 +85,7 @@ int main() {
 
     // Output number of clusters
     std::set<int> unique_labels(labels.begin(), labels.end());
-    std::cout << unique_labels.size() << std::endl;
+    std::cout << "Unique labels: " << unique_labels.size() << std::endl;
 
     // Output number of cosine calls
     // std::cout << NO_COSINE_CALLS << std::endl;
@@ -102,8 +99,6 @@ int main() {
     // // Output average cosine duration
     // std::cout << std::accumulate(COSINE_DURATIONS.begin(), COSINE_DURATIONS.end(), 0.0) / COSINE_DURATIONS.size() << std::endl;
     std::cout << std::endl;
-    //free Eigen's thread-pool buffers
-    //Eigen::internal::set_is_malloc_allowed(false);
     return 0;
 }
 
@@ -1220,15 +1215,14 @@ void RAC_i(
     }
 }
 
-void RAC(
+std::vector<Cluster*> RAC(
     Eigen::MatrixXd& base_arr,
-    std::vector<Cluster*> clusters,
     double max_merge_distance,
     int no_processors = 0,
     std::string distance_metric = "euclidean"
     ) {
 
-    
+    std::vector<Cluster*> clusters;
     for (long i = 0; i < base_arr.cols(); ++i) {
         Cluster* cluster = new Cluster(i);
         clusters.push_back(cluster);
@@ -1243,12 +1237,11 @@ void RAC(
 
     RAC_i(clusters, max_merge_distance, no_processors, distance_arr);
 
-    //return clusters;
+    return clusters;
 }
 
-void RAC(
+std::vector<Cluster*> RAC(
     Eigen::MatrixXd& base_arr,
-    std::vector<Cluster*> clusters,
     double max_merge_distance,
     Eigen::SparseMatrix<bool>& connectivity,
     int batch_size = 0,
@@ -1256,6 +1249,7 @@ void RAC(
     std::string distance_metric = "euclidean"
     ) {
 
+    std::vector<Cluster*> clusters;
     for (long i = 0; i < base_arr.cols(); ++i) {
         Cluster* cluster = new Cluster(i);
         clusters.push_back(cluster);
@@ -1274,7 +1268,7 @@ void RAC(
 
     RAC_i(clusters, max_merge_distance, no_processors, merging_arrays, sort_neighbor_arr, update_neighbors_arrays, nn_count); 
 
-    //return clusters;
+    return clusters;
 }
 
 
@@ -1305,9 +1299,9 @@ std::vector<int> RAC(
 
     std::vector<Cluster*> clusters;
     if (connectivity == nullptr) {
-        RAC(base_arr, clusters, max_merge_distance, NO_PROCESSORS, distance_metric);
+        clusters = RAC(base_arr, max_merge_distance, NO_PROCESSORS, distance_metric);
     } else {
-        RAC(base_arr, clusters, max_merge_distance, *connectivity, BATCHSIZE, NO_PROCESSORS, distance_metric);
+        clusters = RAC(base_arr, max_merge_distance, *connectivity, BATCHSIZE, NO_PROCESSORS, distance_metric);
     }
 
     // Set Eigen Threads according to Number of processors
@@ -1329,16 +1323,14 @@ std::vector<int> RAC(
         cluster_labels.push_back(cluster_id);
     }
 
-    for (Cluster* c : clusters) delete c;
-    clusters.clear();
-
     return cluster_labels;
 }
 //--------------------------------------End RAC Functions--------------------------------------
 
-#ifndef RACPP_BUILDING_LIB_ONLY
+
 //------------------------PYBIND INTERFACE----------------------------------
 
+#ifndef RACPP_BUILDING_LIB_ONLY
 //Wrapper for RAC, convert return vector to a numpy array
 py::array RAC_py(
     Eigen::MatrixXd base_arr,
