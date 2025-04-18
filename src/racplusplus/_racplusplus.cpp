@@ -64,7 +64,7 @@ int main() {
     //set up test
     double max_merge_distance = .035;
     int batch_size = 100;
-    int no_processors = 0;
+    int no_processors = 8;
     //actually run test
     std::vector<int> labels = RAC(test, max_merge_distance, nullptr, batch_size, no_processors, "cosine");
 
@@ -1321,6 +1321,10 @@ std::vector<int> RAC(
     std::vector<int> cluster_labels;
     for (const auto& [index, cluster_id] : cluster_idx) {
         cluster_labels.push_back(cluster_id);
+    }
+
+    for (Cluster* c : clusters) {
+        delete c;            // safe: many entries are nullptr
     }
 
     return cluster_labels;
