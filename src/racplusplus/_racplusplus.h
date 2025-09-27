@@ -235,7 +235,17 @@ std::vector<int> RAC(
     Eigen::SparseMatrix<bool>* connectivity,
     int batch_size,
     int no_processors,
-    std::string distance_metric);
+    std::string distance_metric,
+    std::string init_algo);
+
+std::vector<Cluster*> RAC(
+    Eigen::MatrixXd& base_arr,
+    double max_merge_distance,
+    Eigen::SparseMatrix<bool>& connectivity,
+    int batch_size = 0,
+    int no_processors = 0,
+    std::string distance_metric = "euclidean",
+    std::string init_algo = "generic");
 
 #ifndef RACPP_BUILDING_LIB_ONLY
 py::array RAC_py(
@@ -244,7 +254,9 @@ py::array RAC_py(
     py::object connectivity,
     int batch_size,
     int no_processors,
-    std::string distance_metric);
+    std::string distance_metric,
+    py::object init_algo);
+    //std::string init_algo);
 
 py::array _pairwise_euclidean_distance_py(
     Eigen::MatrixXd base_arr,

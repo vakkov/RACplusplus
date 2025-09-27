@@ -66,7 +66,7 @@ int main() {
     int batch_size = 100;
     int no_processors = 8;
     //actually run test
-    std::vector<int> labels = RAC(test, max_merge_distance, nullptr, batch_size, no_processors, "cosine");
+    std::vector<int> labels = RAC(test, max_merge_distance, nullptr, batch_size, no_processors, "cosine", "generic");
 
     // Output duration
     std::cout << std::accumulate(UPDATE_NEIGHBOR_DURATIONS.begin(), UPDATE_NEIGHBOR_DURATIONS.end(), 0.0) / 1000 << std::endl;
@@ -383,10 +383,11 @@ Eigen::MatrixXd calculate_initial_dissimilarities(
     return distance_mat;
 }
 
+//ORIG
 void calculate_initial_dissimilarities(
     Eigen::MatrixXd& base_arr,
     std::vector<Cluster*>& clusters,
-    Eigen::SparseMatrix<bool>& connectivity,
+    const Eigen::SparseMatrix<bool>& connectivity,
     double max_merge_distance,
     int batch_size,
     std::string distance_metric) {
@@ -398,9 +399,9 @@ void calculate_initial_dissimilarities(
 
         Eigen::MatrixXd distance_mat;
         if (distance_metric == "cosine") {
-            distance_mat = pairwise_cosine(base_arr, batch).array();
+            distance_mat = pairwise_cosine(base_arr, batch); //.array();
         } else {
-            distance_mat = pairwise_euclidean(base_arr, batch).array();
+            distance_mat = pairwise_euclidean(base_arr, batch); //.array();
         }
 
         for (int i = batchStart; i < batchEnd; ++i) {
@@ -435,6 +436,237 @@ void calculate_initial_dissimilarities(
         }
     }
 }
+
+
+// void calculate_initial_dissimilarities(
+//     Eigen::MatrixXd& base_arr,
+//     std::vector<Cluster*>& clusters,
+//     const Eigen::SparseMatrix<bool>& connectivity,
+//     double max_merge_distance,
+//     int batch_size,
+//     std::string distance_metric) {
+
+//     int clustersSize = static_cast<int>(clusters.size());
+    
+//     for (int i = 0; i < clustersSize; ++i) {
+//         Cluster* cluster = clusters[i];
+//         std::vector<std::pair<int, double>> neighbors;
+//         int nearest_neighbor = -1;
+//         double min_distance = std::numeric_limits<double>::infinity();
+        
+//         // Iterate through sparse connections only
+//         for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
+//             int j = it.row();
+            
+//             // Skip self-connection and non-connections
+//             if (j == i || !it.value()) continue;
+            
+//             // Compute distance for this single pair
+//             double distance;
+//             if (distance_metric == "cosine") {
+//                 // For normalized vectors: cosine_distance = 1 - dot_product
+//                 distance = 1.0 - base_arr.col(i).dot(base_arr.col(j));
+//             } else {
+//                 // Euclidean distance
+//                 distance = (base_arr.col(i) - base_arr.col(j)).norm();
+//             }
+            
+//             // Only store if within merge distance
+//             if (distance < max_merge_distance) {
+//                 neighbors.push_back(std::make_pair(j, distance));
+                
+//                 if (distance < min_distance) {
+//                     min_distance = distance;
+//                     nearest_neighbor = j;
+//                 }
+//             }
+//         }
+        
+//         cluster->neighbor_distances = neighbors;
+//         cluster->nn = nearest_neighbor;
+//     }
+// }
+
+// OPUS
+// optimized version that only computes distances for connected pairs in the kNN graph:
+void calculate_initial_dissimilarities_opus(
+    Eigen::MatrixXd& base_arr,
+    std::vector<Cluster*>& clusters,
+    const Eigen::SparseMatrix<bool>& connectivity,
+    double max_merge_distance,
+    int batch_size,
+    std::string distance_metric) {
+
+    int clustersSize = static_cast<int>(clusters.size());
+    
+    // Pre-normalize if using cosine distance
+    Eigen::MatrixXd normalized_arr;
+    if (distance_metric == "cosine") {
+        normalized_arr = base_arr;  // Already normalized in this case
+    }
+    
+    // Process each cluster
+    for (int i = 0; i < clustersSize; ++i) {
+        Cluster* cluster = clusters[i];
+        std::vector<std::pair<int, double>> neighbors;
+        
+        int nearest_neighbor = -1;
+        double min_distance = std::numeric_limits<double>::infinity();
+        
+        // Get the connectivity for this cluster (row or column in sparse matrix)
+        // Since connectivity is symmetric, we can use either row or column
+        for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
+            int j = it.row();  // or it.index() depending on storage order
+            
+            // Skip self-connection
+            if (j == i) continue;
+            
+            // Only compute distance for connected pairs
+            if (it.value()) {
+                double distance;
+                
+                if (distance_metric == "cosine") {
+                    // Compute cosine distance for single pair
+                    // base_arr columns are already normalized
+                    distance = 1.0 - base_arr.col(i).dot(base_arr.col(j));
+                } else {
+                    // Compute euclidean distance for single pair
+                    distance = (base_arr.col(i) - base_arr.col(j)).norm();
+                }
+                
+                // Store as neighbor if within merge distance
+                if (distance < max_merge_distance) {
+                    neighbors.push_back(std::make_pair(j, distance));
+                    
+                    if (distance < min_distance) {
+                        min_distance = distance;
+                        nearest_neighbor = j;
+                    }
+                }
+            }
+        }
+        
+        cluster->neighbor_distances = neighbors;
+        cluster->nn = nearest_neighbor;
+    }
+}
+
+// CODEX
+void calculate_initial_dissimilarities_codex(
+    Eigen::MatrixXd& base_arr,
+    std::vector<Cluster*>& clusters,
+    const Eigen::SparseMatrix<bool>& connectivity,
+    double max_merge_distance,
+    int batch_size,
+    std::string distance_metric) {
+
+    const bool use_cosine = (distance_metric == "cosine");
+    const int clustersSize = static_cast<int>(clusters.size());
+    static_cast<void>(batch_size);
+
+    std::vector<double> column_squared_norms;
+    if (!use_cosine) {
+        column_squared_norms.resize(base_arr.cols());
+        for (int col = 0; col < base_arr.cols(); ++col) {
+            column_squared_norms[col] = base_arr.col(col).squaredNorm();
+        }
+    }
+
+    for (int i = 0; i < clustersSize; ++i) {
+        Cluster* cluster = clusters[i];
+        if (!cluster) {
+            continue;
+        }
+
+        if (cluster->indices.empty()) {
+            cluster->neighbor_distances.clear();
+            cluster->nn = -1;
+            continue;
+        }
+
+        const int cluster_col = cluster->indices.front();
+        const auto cluster_vec = base_arr.col(cluster_col);
+        const double cluster_sq_norm = use_cosine ? 0.0 : column_squared_norms[cluster_col];
+
+        std::vector<std::pair<int, double>> neighbors;
+
+        double min_distance = std::numeric_limits<double>::infinity();
+        int nearest_neighbor = -1;
+
+        for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
+            if (!it.value()) {
+                continue;
+            }
+
+            const int j = it.index();
+            if (j == i || j < 0 || j >= clustersSize) {
+                continue;
+            }
+
+            Cluster* neighbor_cluster = clusters[j];
+            if (!neighbor_cluster || neighbor_cluster->indices.empty()) {
+                continue;
+            }
+
+            const int neighbor_col = neighbor_cluster->indices.front();
+            const auto neighbor_vec = base_arr.col(neighbor_col);
+
+            double distance;
+            if (use_cosine) {
+                distance = 1.0 - cluster_vec.dot(neighbor_vec);
+            } else {
+                const double sq_distance = std::max(
+                    0.0,
+                    cluster_sq_norm + column_squared_norms[neighbor_col] - 2.0 * cluster_vec.dot(neighbor_vec));
+                distance = std::sqrt(sq_distance);
+            }
+
+            neighbors.emplace_back(j, distance);
+
+            if (distance < max_merge_distance && distance < min_distance) {
+                min_distance = distance;
+                nearest_neighbor = j;
+            }
+        }
+
+        cluster->neighbor_distances = std::move(neighbors);
+        cluster->nn = nearest_neighbor;
+    }
+}
+
+enum class InitAlgo { Generic, Opus, Codex };
+
+inline InitAlgo parse_init_algo(const std::string& s_in) {
+  std::string s = s_in;
+  std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+  if (s == "generic")  return InitAlgo::Generic;
+  if (s == "opus") return InitAlgo::Opus;
+  if (s == "codex")    return InitAlgo::Codex;
+  throw std::invalid_argument("init_algo must be one of {'generic','opus','codex'}");
+}
+
+inline void run_initializer(
+    InitAlgo algo,
+    Eigen::MatrixXd& X,
+    std::vector<Cluster*>& C,
+    const Eigen::SparseMatrix<bool>& A,   // Python passes ColMajor
+    double thr, int bs, const std::string& metric) {
+
+  switch (algo) {
+    case InitAlgo::Generic: {
+      calculate_initial_dissimilarities(X, C, A, thr, bs, metric);
+      break;
+    }
+    case InitAlgo::Opus:
+      calculate_initial_dissimilarities_opus(X, C, A, thr, bs, metric);
+      break;
+    case InitAlgo::Codex:
+      calculate_initial_dissimilarities_codex(X, C, A, thr, bs, metric);
+      break;
+  }
+}
+
+
 
 //-----------------------End Distance Calculations-------------------------
 
@@ -1251,9 +1483,10 @@ std::vector<Cluster*> RAC(
     Eigen::MatrixXd& base_arr,
     double max_merge_distance,
     Eigen::SparseMatrix<bool>& connectivity,
-    int batch_size = 0,
-    int no_processors = 0,
-    std::string distance_metric = "euclidean"
+    int batch_size,
+    int no_processors,
+    std::string distance_metric,
+    std::string init_algo
     ) {
 
     std::vector<Cluster*> clusters;
@@ -1267,8 +1500,10 @@ std::vector<Cluster*> RAC(
     std::vector<std::vector<int>> update_neighbors_arrays(no_processors, std::vector<int>(clusters.size()));
     std::vector<int> nn_count = std::vector<int>(clusters.size(), 0);
 
+    const InitAlgo algo = parse_init_algo(init_algo);
     auto start = std::chrono::high_resolution_clock::now();
-    calculate_initial_dissimilarities(base_arr, clusters, connectivity, max_merge_distance, batch_size, distance_metric);
+    //calculate_initial_dissimilarities(base_arr, clusters, connectivity, max_merge_distance, batch_size, distance_metric);
+    run_initializer(algo, base_arr, clusters, connectivity, max_merge_distance, batch_size, distance_metric);
     auto end = std::chrono::high_resolution_clock::now();
     
     std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
@@ -1285,7 +1520,9 @@ std::vector<int> RAC(
     Eigen::SparseMatrix<bool>* connectivity,
     int batch_size = 0,
     int no_processors = 0,
-    std::string distance_metric = "euclidean") {
+    std::string distance_metric = "euclidean",
+    std::string init_algo = ""
+) {
 
     //Processor Count defaults to the number on the machine if not provided or -1 passed
     const int NO_PROCESSORS = (no_processors != 0) ? no_processors : getProcessorCount();
@@ -1308,7 +1545,13 @@ std::vector<int> RAC(
     if (connectivity == nullptr) {
         clusters = RAC(base_arr, max_merge_distance, NO_PROCESSORS, distance_metric);
     } else {
-        clusters = RAC(base_arr, max_merge_distance, *connectivity, BATCHSIZE, NO_PROCESSORS, distance_metric);
+        // sparse mode REQUIRES explicit init_algo
+        if (init_algo.empty()) {
+            throw std::invalid_argument(
+                "When 'connectivity' is provided, you must pass init_algo "
+                "as one of {'generic','opus','codex'}.");
+        }
+        clusters = RAC(base_arr, max_merge_distance, *connectivity, BATCHSIZE, NO_PROCESSORS, distance_metric, init_algo);
     }
 
     // Set Eigen Threads according to Number of processors
@@ -1349,12 +1592,21 @@ py::array RAC_py(
     py::object connectivity = py::none(),
     int batch_size = 0,
     int no_processors = 0,
-    std::string distance_metric = "euclidean") {
+    std::string distance_metric = "euclidean",
+    py::object init_algo = py::none()) {
 
     std::shared_ptr<Eigen::SparseMatrix<bool>> sparse_connectivity = nullptr;
     
     if (!connectivity.is_none()) {
         sparse_connectivity = std::make_shared<Eigen::SparseMatrix<bool>>(connectivity.cast<Eigen::SparseMatrix<bool>>());
+    }
+
+    std::string init_algo_str;
+    if (sparse_connectivity) {
+        if (init_algo.is_none())
+            throw py::value_error("init_algo is required when connectivity is provided; "
+                                  "choose one of {'generic','opus','codex'}.");
+        init_algo_str = init_algo.cast<std::string>();
     }
 
     std::vector<int> cluster_labels = RAC(
@@ -1363,7 +1615,8 @@ py::array RAC_py(
         sparse_connectivity.get(), 
         batch_size, 
         no_processors,
-        distance_metric);
+        distance_metric,
+        init_algo_str);
 
     py::array cluster_labels_arr =  py::cast(cluster_labels);
     return cluster_labels_arr;
@@ -1411,7 +1664,41 @@ PYBIND11_MODULE(_racplusplus, m){
         2023
     )doc";
 
-    m.def("rac", &RAC_py, R"fdoc(
+    // m.def("rac", &RAC_py, R"fdoc(
+    //     Run RAC algorithm on a provided array of points.
+
+    //     Params:
+    //     [base_arr] -        Actual data points array to be clustered. Each row is a point, with each column
+    //                         representing the points value for a particular feature/dimension.
+    //     [max_merge_distance] - Hyperparameter, maximum distance allowed for two clusters to merge with one another.
+    //     [batch_size] -      Optional hyperparameter, batch size for calculating initial dissimilarities 
+    //                         with a connectivity matrix.
+    //                         Default: Defaults to the number of points in base_arr / 10 if 0 passed or no value passed.
+    //     [connectivity] -    Optional: Connectivity matrix indicating whether points can be considered as neighbors.
+    //                         Value of 1 at index i,j indicates point i and j are connected, 0 indicates disconnected.
+    //                         Default: No connectivity matrix, use pairwise cosine to calculate distances.
+    //     [no_processors] -   Hyperparameter, number of processors to use during computation. 
+    //                         Defaults to the number of processors found on your machine if 0 passed 
+    //                         or no value passed.
+    //     [distance_metric] - Optional: Distance metric to use for calculating distances between points.
+    //                         Default: Euclidean distance.
+    //     [init_algo] -       Required when a connectivity matrix is provided; one of {"generic","opus","codex"}.
+    //                         Ignored in dense mode (when connectivity=None).
+    //                         Default: "" (empty).
+
+    //     Output:
+    //     Returns a numpy array of the group # each point in base_arr was assigned to.
+    // )fdoc");
+
+    m.def("rac", &RAC_py,
+      py::arg("base_arr"),
+      py::arg("max_merge_distance"),
+      py::arg("connectivity") = py::none(),
+      py::arg("batch_size") = 0,
+      py::arg("no_processors") = 0,
+      py::arg("distance_metric") = "euclidean",
+      py::arg("init_algo") = py::none(),
+      R"fdoc(
         Run RAC algorithm on a provided array of points.
 
         Params:
@@ -1420,19 +1707,16 @@ PYBIND11_MODULE(_racplusplus, m){
         [max_merge_distance] - Hyperparameter, maximum distance allowed for two clusters to merge with one another.
         [batch_size] -      Optional hyperparameter, batch size for calculating initial dissimilarities 
                             with a connectivity matrix.
-                            Default: Defaults to the number of points in base_arr / 10 if 0 passed or no value passed.
-        [connectivity] -    Optional: Connectivity matrix indicating whether points can be considered as neighbors.
-                            Value of 1 at index i,j indicates point i and j are connected, 0 indicates disconnected.
-                            Default: No connectivity matrix, use pairwise cosine to calculate distances.
-        [no_processors] -   Hyperparameter, number of processors to use during computation. 
-                            Defaults to the number of processors found on your machine if 0 passed 
-                            or no value passed.
-        [distance_metric] - Optional: Distance metric to use for calculating distances between points.
-                            Default: Euclidean distance.
-
+                            Default: number of points in base_arr / 10 if 0.
+        [connectivity] -    Optional: boolean adjacency (SciPy CSR) constraining neighbor consideration.
+                            Default: None (no connectivity graph).
+        [no_processors] -   Optional, defaults to #hardware cores if 0.
+        [distance_metric] - 'euclidean' or 'cosine'. Default: 'euclidean'.
+        [init_algo] -       Required if connectivity is provided. One of {'generic','opus','codex'}.
+                            If connectivity is None, this is ignored (defaults to 'generic').
         Output:
-        Returns a numpy array of the group # each point in base_arr was assigned to.
-    )fdoc");
+        Numpy array of cluster labels for each row in base_arr.
+      )fdoc");
 
     m.def("_pairwise_euclidean_distance", &_pairwise_euclidean_distance_py, R"fdoc(
         Calculate pairwise euclidean distance 
