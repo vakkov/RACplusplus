@@ -1,10 +1,15 @@
 #ifndef RACPP_BUILDING_LIB_ONLY
+#define RACPP_BUILDING_LIB_ONLY 0
+#endif
+
+#if !RACPP_BUILDING_LIB_ONLY
 #include <pybind11/pybind11.h>
 #include <pybind11/eigen.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 namespace py = pybind11;
 #endif
+
 #include <array>
 #include <tuple>
 #include <unordered_map>
@@ -23,9 +28,21 @@ namespace py = pybind11;
 
 #include "_racplusplus.h"
 
+// Timing/stat tracking globals
+std::vector<long> UPDATE_NEIGHBOR_DURATIONS;
+std::vector<long> UPDATE_NN_DURATIONS;
+std::vector<long> COSINE_DURATIONS;
+std::vector<long> INDICES_DURATIONS;
+std::vector<long> MERGE_DURATIONS;
+std::vector<long> MISC_MERGE_DURATIONS;
+std::vector<long> INITIAL_NEIGHBOR_DURATIONS;
+std::vector<long> HASH_DURATIONS;
+std::vector<double> UPDATE_PERCENTAGES;
+
 //get number of processors
 size_t getProcessorCount() {
     const auto NO_PROCESSORS = std::thread::hardware_concurrency();
+    std::cout << "Processors: " << NO_PROCESSORS << std::endl;
     return NO_PROCESSORS != 0 ? static_cast<size_t>(NO_PROCESSORS) : static_cast<size_t>(8);
 }
 
@@ -42,8 +59,8 @@ std::string vectorToString(const std::vector<std::pair<int, int>>& merges) {
     return oss.str();
 }
 
-//----main
-int main() {
+//----standalone test driver
+int racplusplus_cli_test() {
     std::cout << std::endl;
     std::cout << "Starting Randomized RAC Test" << std::endl;
     std::cout << "Number of Processors Found for Program Use: " << getProcessorCount() << std::endl;
@@ -329,8 +346,8 @@ void update_cluster_dissimilarities(
     Eigen::MatrixXd& distance_arr,
     const int NO_PROCESSORS) {
 
-    if (merges.size() / NO_PROCESSORS > 10) {
-        parallel_merge_clusters(merges, distance_arr, clusters, 1);
+    if (merges.size() > 0) {
+        parallel_merge_clusters(merges, distance_arr, clusters, NO_PROCESSORS);
     } else {
         for (std::pair<int, int> merge : merges) {
             merge_cluster_full(merge, merges, clusters, distance_arr);
@@ -398,9 +415,9 @@ void calculate_initial_dissimilarities(
 
         Eigen::MatrixXd distance_mat;
         if (distance_metric == "cosine") {
-            distance_mat = pairwise_cosine(base_arr, batch).array();
+            distance_mat = pairwise_cosine(base_arr, batch); //.array();
         } else {
-            distance_mat = pairwise_euclidean(base_arr, batch).array();
+            distance_mat = pairwise_euclidean(base_arr, batch); //.array();
         }
 
         for (int i = batchStart; i < batchEnd; ++i) {
@@ -1341,7 +1358,7 @@ std::vector<int> RAC(
 
 //------------------------PYBIND INTERFACE----------------------------------
 
-#ifndef RACPP_BUILDING_LIB_ONLY
+#if !RACPP_BUILDING_LIB_ONLY
 //Wrapper for RAC, convert return vector to a numpy array
 py::array RAC_py(
     Eigen::MatrixXd base_arr,
@@ -1456,7 +1473,7 @@ PYBIND11_MODULE(_racplusplus, m){
         Returns a numpy distance array
     )fdoc");
 
-    m.def("test_rac", &main, R"fdoc(
+    m.def("test_rac", &racplusplus_cli_test, R"fdoc(
         Testing function to run and time RAC's run in C++.
     )fdoc");
 

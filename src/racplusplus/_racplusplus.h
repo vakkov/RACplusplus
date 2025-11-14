@@ -1,3 +1,7 @@
+#ifndef RACPP_BUILDING_LIB_ONLY
+#define RACPP_BUILDING_LIB_ONLY 0
+#endif
+
 #include <array>
 #include <tuple>
 #include <unordered_map>
@@ -9,17 +13,17 @@
 #define GLOBAL_TIMING_VARS_H
 
 // Store update neighbor times
-std::vector<long> UPDATE_NEIGHBOR_DURATIONS;
+extern std::vector<long> UPDATE_NEIGHBOR_DURATIONS;
 // Store update NN times
-std::vector<long> UPDATE_NN_DURATIONS;
+extern std::vector<long> UPDATE_NN_DURATIONS;
 // Store the durations of each call to cosine
-std::vector<long> COSINE_DURATIONS;
-std::vector<long> INDICES_DURATIONS;
-std::vector<long> MERGE_DURATIONS;
-std::vector<long> MISC_MERGE_DURATIONS;
-std::vector<long> INITIAL_NEIGHBOR_DURATIONS;
-std::vector<long> HASH_DURATIONS;
-std::vector<double> UPDATE_PERCENTAGES;
+extern std::vector<long> COSINE_DURATIONS;
+extern std::vector<long> INDICES_DURATIONS;
+extern std::vector<long> MERGE_DURATIONS;
+extern std::vector<long> MISC_MERGE_DURATIONS;
+extern std::vector<long> INITIAL_NEIGHBOR_DURATIONS;
+extern std::vector<long> HASH_DURATIONS;
+extern std::vector<double> UPDATE_PERCENTAGES;
 
 #endif // GLOBAL_TIMING_VARS_H
 
@@ -255,4 +259,3 @@ py::array _pairwise_cosine_distance_py(
     Eigen::MatrixXd query_arr);
 #endif
 //--------------------------------------End RAC Functions--------------------------------------
-
