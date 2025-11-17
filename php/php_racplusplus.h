@@ -12,7 +12,7 @@ extern zend_module_entry racplusplus_module_entry;
 
 PHP_MINIT_FUNCTION(racplusplus);
 PHP_MINFO_FUNCTION(racplusplus);
-
+PHP_MSHUTDOWN_FUNCTION(racplusplus);
 PHP_FUNCTION(racplusplus_rac);
 
 #endif // PHP_RACPLUSPLUS_H
