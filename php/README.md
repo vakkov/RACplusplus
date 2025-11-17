@@ -14,10 +14,14 @@ This directory contains a minimal PHP extension that exposes the `rac()` cluster
 ```
 cd php
 phpize
-./configure --enable-racplusplus --with-racplusplus-eigen=/usr/include/eigen3
+./configure --enable-racplusplus --with-racplusplus-eigen=../eigen-3.4.0/
 make
 make test   # optional; currently no PHPTs are defined
 sudo make install
+```
+## Debug version
+```
+/etc/php8.2-dbg/bin/phpize && ./configure --enable-racplusplus --with-racplusplus-eigen=../eigen-3.4.0/ --with-php-config=/etc/php8.2-dbg/bin/php-config && make -j4
 ```
 
 `phpize` will generate the build system for your locally installed PHP. If Eigen is installed in a non-standard location, set `EIGEN3_INCLUDE_DIR=/path/to/eigen3` before running `./configure` or use the `--with-racplusplus-eigen` switch shown above.

@@ -8,6 +8,10 @@ PHP_ARG_WITH(racplusplus-eigen, for Eigen include directory,
 
 if test "$PHP_RACPLUSPLUS" != "no"; then
   PHP_REQUIRE_CXX()
+  #CPPFLAGS="$CPPFLAGS -DRACPP_BUILDING_LIB_ONLY=1 -O1 -g -fsanitize=address -fno-omit-frame-pointer"
+  #CXXFLAGS="$CXXFLAGS -std=gnu++17 -fopenmp -O1 -g -fsanitize=address -fno-omit-frame-pointer"
+  #DFLAGS="-fsanitize=address"
+
   CPPFLAGS="$CPPFLAGS -DRACPP_BUILDING_LIB_ONLY=1"
   CXXFLAGS="$CXXFLAGS -std=gnu++17 -fopenmp"
 
