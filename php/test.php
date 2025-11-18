@@ -40,7 +40,7 @@ $redisDb   = (int) (getenv('REDIS_DB') ?: 'docs');
 $keyPrefix = 'doc:task495_40a01d425d600b4f6b3c3f05cd36f61f:';
 
 $redis = new Redis();
-$redis->setOption(Redis::OPT_SERIALIZER, Redis::SERIALIZER_MSGPACK);
+$redis->setOption(Redis::OPT_SERIALIZER, Redis::SERIALIZER_NONE);
 
 if (!$redis->connect($redisHost, $redisPort)) {
     fwrite(STDERR, "Unable to connect to Redis at {$redisHost}:{$redisPort}\n");
@@ -50,20 +50,21 @@ if (!$redis->connect($redisHost, $redisPort)) {
 
 // Collect all keys matching the specified prefix.
 $keys = $redis->keys($keyPrefix . '*');
-sort($keys, SORT_NATURAL);
+sort($keys, SORT_STRING);
 
 $points = [];
 foreach ($keys as $key) {
-    $hash = $redis->hGetAll($key);
-    if (!isset($hash['embedding'])) {
+    $embedding = $redis->hGet($key, 'embedding');
+    if ($embedding === false || $embedding === null) {
         continue;
     }
 
-    $embedding = $hash['embedding'];
+    $floats = unpack('g*', $embedding); // little-endian float32, matches Python
+    if ($floats === false) {
+        continue;
+    }
 
-    $embedding = unpack('f*', $embedding);
-
-    $points[] = array_map('floatval', $embedding);
+    $points[] = array_values($floats);
 }
 
 if (empty($points)) {
@@ -77,5 +78,26 @@ $batchSize = 500;
 $noProcessors = 8;
 $distanceMetric = 'cosine';
 
-$labels = racplusplus_rac($points, $maxMergeDistance, $connectivity, $batchSize, $noProcessors, $distanceMetric);
+$labels = racplusplus_rac(
+    $points, 
+    $maxMergeDistance, 
+    $connectivity, 
+    $batchSize, 
+    $noProcessors, 
+    $distanceMetric
+);
 print_r($labels);
+
+$resultsPath = getenv('RAC_RESULTS_PATH');
+if ($resultsPath !== false && $resultsPath !== '') {
+    $encoded = json_encode($labels, JSON_PRETTY_PRINT);
+    if ($encoded === false) {
+        fwrite(STDERR, "Failed to encode clustering labels as JSON\n");
+        exit(1);
+    }
+    if (file_put_contents($resultsPath, $encoded . PHP_EOL) === false) {
+        fwrite(STDERR, "Unable to write clustering labels to {$resultsPath}\n");
+        exit(1);
+    }
+    fprintf(STDERR, "Wrote clustering results to %s\n", $resultsPath);
+}
