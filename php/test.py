@@ -50,7 +50,6 @@ def main() -> None:
         print(f"No embeddings with key prefix {key_prefix}", file=sys.stderr)
         raise SystemExit(1)
 
-    import pdb; pdb.set_trace()
     base_arr = np.asarray(points, dtype=np.float64)
 
     max_merge_distance = float(os.getenv("RAC_MAX_MERGE_DISTANCE", "0.35"))
