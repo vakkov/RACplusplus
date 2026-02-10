@@ -17,6 +17,9 @@ Based on the paper:
 }
 ```
 
+## Build
+python3 -m pip wheel . -w dist
+
 ## Contributors
 
 Porter Hunley — @porterehunley

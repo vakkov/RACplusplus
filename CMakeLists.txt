@@ -26,13 +26,6 @@ include_directories(${Python3_INCLUDE_DIRS})
 link_directories(${Python3_LIBRARY_DIRS})
 
 # Set compilers
-message(STATUS "\n-- Setting C and C++ Compilers to llvm...\n")
-# print cc and cxx env variables
-
-set(CMAKE_CXX_COMPILER "$ENV{CXX}")
-set(ENV{CPPFLAGS} "-I${LOCAL_INCLUDE_DIRS}")
-
-# Print out compiler information
 message(STATUS "CMAKE_CXX_COMPILER: ${CMAKE_CXX_COMPILER}")
 
 #Set Opt, Warning Flags, Linker
@@ -98,4 +91,4 @@ endif()
 
 #Install the Cmake Target in src directory specified in setup.py
 install(TARGETS ${python_module_name}
-        DESTINATION .) 
+        DESTINATION .)
