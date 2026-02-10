@@ -317,16 +317,132 @@ void update_cluster_dissimilarities(
         NO_PROCESSORS);
 }
 
-// Fix #2: Serialize full-matrix merge to avoid data races on shared distance_arr.
-// The previous parallel version had threads reading/writing overlapping columns.
+// Fix #2: Two-phase full-matrix merge to avoid data races on shared distance_arr.
+// Phase 1 computes updated columns in parallel (read-only), phase 2 writes back serially.
 void update_cluster_dissimilarities(
     std::vector<std::pair<int, int> >& merges,
     std::vector<Cluster>& clusters,
     Eigen::MatrixXd& distance_arr,
     const int NO_PROCESSORS) {
 
-    for (auto& merge : merges) {
-        merge_cluster_full(merge, merges, clusters, distance_arr);
+    if (merges.empty()) {
+        return;
+    }
+
+    // Two-phase merge update:
+    //   1) Parallel, read-only compute of updated columns (based on a snapshot of cluster sizes + distance_arr)
+    //   2) Serial write-back into distance_arr and cluster index vectors
+    //
+    // This avoids data races from concurrent writes to shared state while restoring parallel speed
+    // for the full distance-matrix (no-connectivity) hot path.
+
+    const size_t merge_count = merges.size();
+
+    std::vector<int> cluster_sizes(clusters.size());
+    for (size_t i = 0; i < clusters.size(); i++) {
+        cluster_sizes[i] = static_cast<int>(clusters[i].indices.size());
+    }
+
+    std::vector<int> merge_main_ids(merge_count);
+    std::vector<int> merge_secondary_ids(merge_count);
+    std::vector<double> merge_main_sizes(merge_count);
+    std::vector<double> merge_secondary_sizes(merge_count);
+    std::vector<double> merge_inv_sizes(merge_count);
+
+    for (size_t i = 0; i < merge_count; i++) {
+        merge_main_ids[i] = merges[i].first;
+        merge_secondary_ids[i] = merges[i].second;
+
+        merge_main_sizes[i] = static_cast<double>(cluster_sizes[merge_main_ids[i]]);
+        merge_secondary_sizes[i] = static_cast<double>(cluster_sizes[merge_secondary_ids[i]]);
+
+        merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
+    }
+
+    std::vector<Eigen::VectorXd> merged_columns(merge_count);
+
+    auto compute_range = [&](size_t start, size_t end) {
+        const double inf = std::numeric_limits<double>::infinity();
+
+        for (size_t i = start; i < end; i++) {
+            const int main_id = merge_main_ids[i];
+            const int secondary_id = merge_secondary_ids[i];
+
+            const double main_size = merge_main_sizes[i];
+            const double secondary_size = merge_secondary_sizes[i];
+            const double inv_ab = merge_inv_sizes[i];
+
+            // Base: average-linkage merge for (main, secondary) against all clusters.
+            Eigen::VectorXd avg_col = (main_size * distance_arr.col(main_id) + secondary_size * distance_arr.col(secondary_id)) * inv_ab;
+
+            // Patch entries for other merges so distances reflect their merged clusters (not their pre-merge constituents).
+            for (size_t j = 0; j < merge_count; j++) {
+                if (merge_main_ids[j] == main_id || merge_secondary_ids[j] == main_id) {
+                    continue;
+                }
+
+                const int merge_main = merge_main_ids[j];
+                const int merge_secondary = merge_secondary_ids[j];
+                const double inv_cd = merge_inv_sizes[j];
+
+                const double dist_main_to_cd =
+                    (merge_main_sizes[j] * distance_arr(merge_main, main_id) +
+                     merge_secondary_sizes[j] * distance_arr(merge_secondary, main_id)) *
+                    inv_cd;
+                const double dist_secondary_to_cd =
+                    (merge_main_sizes[j] * distance_arr(merge_main, secondary_id) +
+                     merge_secondary_sizes[j] * distance_arr(merge_secondary, secondary_id)) *
+                    inv_cd;
+
+                const double dist_ab_to_cd = (main_size * dist_main_to_cd + secondary_size * dist_secondary_to_cd) * inv_ab;
+                avg_col[merge_main] = dist_ab_to_cd;
+                avg_col[merge_secondary] = dist_ab_to_cd;
+            }
+
+            avg_col[main_id] = inf;
+            avg_col[secondary_id] = inf;
+
+            merged_columns[i] = std::move(avg_col);
+        }
+    };
+
+    size_t requested_threads = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : static_cast<size_t>(1);
+    size_t no_threads = std::min(requested_threads, merge_count);
+
+    if (no_threads <= 1) {
+        compute_range(0, merge_count);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(no_threads);
+
+        size_t chunk_size = merge_count / no_threads;
+        size_t remainder = merge_count % no_threads;
+
+        size_t start = 0;
+        for (size_t t = 0; t < no_threads; t++) {
+            size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+            threads.emplace_back(compute_range, start, end);
+            start = end;
+        }
+
+        for (auto& th : threads) {
+            th.join();
+        }
+    }
+
+    // Serial write-back.
+    for (size_t i = 0; i < merge_count; i++) {
+        const int main_id = merge_main_ids[i];
+        const int secondary_id = merge_secondary_ids[i];
+
+        distance_arr.col(main_id) = merged_columns[i];
+
+        Cluster& main_cluster = clusters[main_id];
+        Cluster& secondary_cluster = clusters[secondary_id];
+
+        main_cluster.indices.reserve(main_cluster.indices.size() + secondary_cluster.indices.size());
+        main_cluster.indices.insert(main_cluster.indices.end(), secondary_cluster.indices.begin(), secondary_cluster.indices.end());
+        secondary_cluster.indices.clear();
     }
 
     update_cluster_neighbors(distance_arr, merges);
@@ -1170,21 +1286,13 @@ std::vector<int> RAC(
         RAC_i(clusters, active_indices, max_merge_distance, NO_PROCESSORS, merging_arrays, sort_neighbor_arr, update_neighbors_arrays, nn_count);
     }
 
-    // Extract labels using active_indices (no nullptr checks needed)
-    std::vector<std::pair<int, int> > cluster_idx;
+    // Direct-index label assignment: O(N) instead of O(N log N) sort
+    std::vector<int> cluster_labels(base_arr.cols());
     for (int idx : active_indices) {
         const Cluster& cluster = clusters[idx];
         for (int index : cluster.indices) {
-            cluster_idx.push_back(std::make_pair(index, cluster.id));
+            cluster_labels[index] = cluster.id;
         }
-    }
-
-    std::sort(cluster_idx.begin(), cluster_idx.end());
-
-    std::vector<int> cluster_labels;
-    cluster_labels.reserve(cluster_idx.size());
-    for (const auto& [index, cluster_id] : cluster_idx) {
-        cluster_labels.push_back(cluster_id);
     }
 
     // No manual delete needed — vector<Cluster> cleans up automatically
