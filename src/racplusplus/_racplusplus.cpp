@@ -331,6 +331,9 @@ void update_cluster_dissimilarities(
 
 // Fix #2: Two-phase full-matrix merge to avoid data races on shared distance_arr.
 // Phase 1 computes updated columns in parallel (read-only), phase 2 writes back serially.
+// Merges are processed in batches to cap peak memory — each batch pre-allocates at most
+// MERGE_BATCH columns (≈480 MB for 60k) instead of one per merge (could be 4+ GB).
+// Cross-batch interactions are handled by the updated dist; intra-batch by the patch.
 void update_cluster_dissimilarities(
     std::vector<std::pair<int, int> >& merges,
     std::vector<Cluster>& clusters,
@@ -343,125 +346,113 @@ void update_cluster_dissimilarities(
         return;
     }
 
-    // Two-phase merge update:
-    //   1) Parallel, read-only compute of updated columns (based on a snapshot of cluster sizes + dist)
-    //   2) Serial write-back into dist + DSU union
-    //
-    // This avoids data races from concurrent writes to shared state while restoring parallel speed
-    // for the full distance-matrix (no-connectivity) hot path.
-
     const size_t merge_count = merges.size();
-
-    std::vector<int> merge_main_ids(merge_count);
-    std::vector<int> merge_secondary_ids(merge_count);
-    std::vector<double> merge_main_sizes(merge_count);
-    std::vector<double> merge_secondary_sizes(merge_count);
-    std::vector<double> merge_inv_sizes(merge_count);
-
-    for (size_t i = 0; i < merge_count; i++) {
-        merge_main_ids[i] = merges[i].first;
-        merge_secondary_ids[i] = merges[i].second;
-
-        merge_main_sizes[i] = static_cast<double>(dsu_size[merge_main_ids[i]]);
-        merge_secondary_sizes[i] = static_cast<double>(dsu_size[merge_secondary_ids[i]]);
-
-        merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
-    }
-
     const int N = dist.N;
+    const size_t MERGE_BATCH = 1024;
 
-    // Pre-allocate all result columns (uninitialized — will be fully written in compute phase).
-    std::vector<Eigen::VectorXd> merged_columns(merge_count);
-    for (size_t i = 0; i < merge_count; i++) {
+    // Pre-allocate reusable column buffers — capped at MERGE_BATCH.
+    const size_t max_batch = std::min(merge_count, MERGE_BATCH);
+    std::vector<Eigen::VectorXd> merged_columns(max_batch);
+    for (size_t i = 0; i < max_batch; i++) {
         merged_columns[i].resize(N);
     }
 
-    auto compute_range = [&](size_t start, size_t end) {
-        const double inf = std::numeric_limits<double>::infinity();
+    for (size_t batch_start = 0; batch_start < merge_count; batch_start += MERGE_BATCH) {
+        const size_t batch_end = std::min(batch_start + MERGE_BATCH, merge_count);
+        const size_t batch_size = batch_end - batch_start;
 
-        // Thread-local scratch buffers — reused across merges, no per-merge allocation.
-        Eigen::VectorXd main_col(N);
-        Eigen::VectorXd sec_col(N);
+        // Prep merge metadata for this batch.
+        // Sizes come from dsu_size — correct because merges are disjoint, so
+        // this batch's clusters haven't been touched by earlier batches' unions.
+        std::vector<int> merge_main_ids(batch_size);
+        std::vector<int> merge_secondary_ids(batch_size);
+        std::vector<double> merge_main_sizes(batch_size);
+        std::vector<double> merge_secondary_sizes(batch_size);
+        std::vector<double> merge_inv_sizes(batch_size);
 
-        for (size_t i = start; i < end; i++) {
-            const int main_id = merge_main_ids[i];
-            const int secondary_id = merge_secondary_ids[i];
+        for (size_t i = 0; i < batch_size; i++) {
+            const size_t global_i = batch_start + i;
+            merge_main_ids[i] = merges[global_i].first;
+            merge_secondary_ids[i] = merges[global_i].second;
 
-            const double main_size = merge_main_sizes[i];
-            const double secondary_size = merge_secondary_sizes[i];
-            const double inv_ab = merge_inv_sizes[i];
+            merge_main_sizes[i] = static_cast<double>(dsu_size[merge_main_ids[i]]);
+            merge_secondary_sizes[i] = static_cast<double>(dsu_size[merge_secondary_ids[i]]);
+            merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
+        }
 
-            // Fill scratch buffers (no allocation).
-            dist.get_col_into(main_id, main_col);
-            dist.get_col_into(secondary_id, sec_col);
+        // Parallel compute for this batch.
+        auto compute_range = [&](size_t start, size_t end) {
+            const double inf = std::numeric_limits<double>::infinity();
+            Eigen::VectorXd main_col(N);
+            Eigen::VectorXd sec_col(N);
 
-            // Compute directly into pre-allocated merged_columns[i].
-            merged_columns[i].noalias() = (main_size * main_col + secondary_size * sec_col) * inv_ab;
+            for (size_t i = start; i < end; i++) {
+                const int main_id = merge_main_ids[i];
+                const int secondary_id = merge_secondary_ids[i];
+                const double main_size = merge_main_sizes[i];
+                const double secondary_size = merge_secondary_sizes[i];
+                const double inv_ab = merge_inv_sizes[i];
 
-            // Patch entries for other merges so distances reflect their merged clusters (not their pre-merge constituents).
-            for (size_t j = 0; j < merge_count; j++) {
-                if (merge_main_ids[j] == main_id || merge_secondary_ids[j] == main_id) {
-                    continue;
+                dist.get_col_into(main_id, main_col);
+                dist.get_col_into(secondary_id, sec_col);
+                merged_columns[i].noalias() = (main_size * main_col + secondary_size * sec_col) * inv_ab;
+
+                // Patch: only for other merges within THIS batch.
+                // Cross-batch merges are already reflected in dist from earlier write-backs.
+                for (size_t j = 0; j < batch_size; j++) {
+                    if (merge_main_ids[j] == main_id || merge_secondary_ids[j] == main_id) continue;
+
+                    const int merge_main = merge_main_ids[j];
+                    const int merge_secondary = merge_secondary_ids[j];
+                    const double inv_cd = merge_inv_sizes[j];
+
+                    const double dist_main_to_cd =
+                        (merge_main_sizes[j] * dist.get(merge_main, main_id) +
+                         merge_secondary_sizes[j] * dist.get(merge_secondary, main_id)) * inv_cd;
+                    const double dist_secondary_to_cd =
+                        (merge_main_sizes[j] * dist.get(merge_main, secondary_id) +
+                         merge_secondary_sizes[j] * dist.get(merge_secondary, secondary_id)) * inv_cd;
+
+                    const double dist_ab_to_cd = (main_size * dist_main_to_cd + secondary_size * dist_secondary_to_cd) * inv_ab;
+                    merged_columns[i][merge_main] = dist_ab_to_cd;
+                    merged_columns[i][merge_secondary] = dist_ab_to_cd;
                 }
 
-                const int merge_main = merge_main_ids[j];
-                const int merge_secondary = merge_secondary_ids[j];
-                const double inv_cd = merge_inv_sizes[j];
-
-                const double dist_main_to_cd =
-                    (merge_main_sizes[j] * dist.get(merge_main, main_id) +
-                     merge_secondary_sizes[j] * dist.get(merge_secondary, main_id)) *
-                    inv_cd;
-                const double dist_secondary_to_cd =
-                    (merge_main_sizes[j] * dist.get(merge_main, secondary_id) +
-                     merge_secondary_sizes[j] * dist.get(merge_secondary, secondary_id)) *
-                    inv_cd;
-
-                const double dist_ab_to_cd = (main_size * dist_main_to_cd + secondary_size * dist_secondary_to_cd) * inv_ab;
-                merged_columns[i][merge_main] = dist_ab_to_cd;
-                merged_columns[i][merge_secondary] = dist_ab_to_cd;
+                merged_columns[i][main_id] = inf;
+                merged_columns[i][secondary_id] = inf;
             }
+        };
 
-            merged_columns[i][main_id] = inf;
-            merged_columns[i][secondary_id] = inf;
-        }
-    };
+        size_t requested_threads = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
+        size_t no_threads = std::min(requested_threads, batch_size);
 
-    size_t requested_threads = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : static_cast<size_t>(1);
-    size_t no_threads = std::min(requested_threads, merge_count);
-
-    if (no_threads <= 1) {
-        compute_range(0, merge_count);
-    } else {
-        std::vector<std::thread> threads;
-        threads.reserve(no_threads);
-
-        size_t chunk_size = merge_count / no_threads;
-        size_t remainder = merge_count % no_threads;
-
-        size_t start = 0;
-        for (size_t t = 0; t < no_threads; t++) {
-            size_t end = start + chunk_size + (t < remainder ? 1 : 0);
-            threads.emplace_back(compute_range, start, end);
-            start = end;
+        if (no_threads <= 1) {
+            compute_range(0, batch_size);
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(no_threads);
+            size_t chunk_size = batch_size / no_threads;
+            size_t remainder = batch_size % no_threads;
+            size_t start = 0;
+            for (size_t t = 0; t < no_threads; t++) {
+                size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+                threads.emplace_back(compute_range, start, end);
+                start = end;
+            }
+            for (auto& th : threads) th.join();
         }
 
-        for (auto& th : threads) {
-            th.join();
+        // Serial write-back: update dist columns first, then fill infinity for secondaries.
+        // Order matters: set_col must complete for all merges before fill_infinity,
+        // otherwise fill_infinity(B) could be overwritten by a later set_col(C) writing to dist[C][B].
+        for (size_t i = 0; i < batch_size; i++) {
+            dist.set_col(merge_main_ids[i], merged_columns[i]);
+            dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
+        }
+        for (size_t i = 0; i < batch_size; i++) {
+            dist.fill_infinity(merge_secondary_ids[i]);
         }
     }
-
-    // Serial write-back.
-    for (size_t i = 0; i < merge_count; i++) {
-        const int main_id = merge_main_ids[i];
-        const int secondary_id = merge_secondary_ids[i];
-
-        dist.set_col(main_id, merged_columns[i]);
-
-        dsu_union(dsu_parent, dsu_size, main_id, secondary_id);
-    }
-
-    update_cluster_neighbors(dist, merges);
 }
 
 SymDistMatrix calculate_initial_dissimilarities(
