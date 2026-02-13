@@ -1311,7 +1311,7 @@ static std::vector<int> RAC_impl(
 
     const int NO_PROCESSORS = (no_processors != 0) ? no_processors : getProcessorCount();
     const int N = static_cast<int>(base_arr.cols());
-    const int BATCHSIZE = (batch_size != 0) ? batch_size : N / 10;
+    const int BATCHSIZE = (batch_size != 0) ? batch_size : std::max(1, N / 10);
 
     Eigen::setNbThreads(NO_PROCESSORS);
 
