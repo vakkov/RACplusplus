@@ -6,6 +6,7 @@
 #include <tuple>
 #include <vector>
 #include <set>
+#include <limits>
 #include "Eigen/Dense"
 #include "Eigen/Sparse"
 
@@ -45,10 +46,68 @@ public:
     Cluster(int id);
 
     void update_nn(double max_merge_distance);
-    void update_nn(Eigen::MatrixXd& distance_arr, double max_merge_distance);
+    void update_nn(const SymDistMatrix& dist, double max_merge_distance);
 };
 
 #endif //CLUSTER_H
+
+#ifndef SYMDISTMATRIX_H
+#define SYMDISTMATRIX_H
+
+class SymDistMatrix {
+public:
+    int N;
+    std::vector<double> data;
+
+    explicit SymDistMatrix(int n)
+        : N(n), data(static_cast<size_t>(n) * (n - 1) / 2,
+               std::numeric_limits<double>::infinity()) {}
+
+    inline size_t tri_idx(int i, int j) const {
+        return static_cast<size_t>(i) * N
+             - static_cast<size_t>(i) * (i + 1) / 2
+             + j - i - 1;
+    }
+
+    inline double get(int i, int j) const {
+        if (i == j) return std::numeric_limits<double>::infinity();
+        if (i > j) std::swap(i, j);
+        return data[tri_idx(i, j)];
+    }
+
+    inline void set(int i, int j, double val) {
+        if (i == j) return;
+        if (i > j) std::swap(i, j);
+        data[tri_idx(i, j)] = val;
+    }
+
+    Eigen::VectorXd get_col(int col_id) const {
+        Eigen::VectorXd col(N);
+        for (int k = 0; k < N; ++k) {
+            col[k] = get(k, col_id);
+        }
+        return col;
+    }
+
+    void set_col(int col_id, const Eigen::VectorXd& col) {
+        for (int k = 0; k < N; ++k) {
+            if (k != col_id) {
+                set(k, col_id, col[k]);
+            }
+        }
+    }
+
+    void fill_infinity(int cluster_id) {
+        const double inf = std::numeric_limits<double>::infinity();
+        for (int k = 0; k < N; ++k) {
+            if (k != cluster_id) {
+                set(k, cluster_id, inf);
+            }
+        }
+    }
+};
+
+#endif // SYMDISTMATRIX_H
 
 //--------------------Helpers------------------------------------
 //Function to optimize to # of processors
@@ -91,10 +150,10 @@ void update_cluster_dissimilarities(
 void update_cluster_dissimilarities(
     std::vector<std::pair<int, int> >& merges,
     std::vector<Cluster>& clusters,
-    Eigen::MatrixXd& distance_arr,
+    SymDistMatrix& dist,
     const int NO_PROCESSORS);
 
-Eigen::MatrixXd calculate_initial_dissimilarities(
+SymDistMatrix calculate_initial_dissimilarities(
     Eigen::MatrixXd& base_arr,
     std::vector<Cluster>& clusters,
     double max_merge_distance,
@@ -111,12 +170,6 @@ void calculate_initial_dissimilarities(
 //-----------------------End Distance Calculations-------------------------
 
 //-----------------------Merging Functions-----------------------------------
-void merge_cluster_full(
-    std::pair<int, int>& merge,
-    std::vector<std::pair<int, int>>& merges,
-    std::vector<Cluster>& clusters,
-    Eigen::MatrixXd& distance_arr);
-
 void merge_cluster_compute_linkage(
     std::pair<int, int>& merge,
     std::vector<Cluster>& clusters,
@@ -161,7 +214,7 @@ void update_cluster_neighbors(
     std::vector<int>& update_neighbors);
 
 void update_cluster_neighbors(
-    Eigen::MatrixXd& distance_arr,
+    SymDistMatrix& dist,
     std::vector<std::pair<int, int>> merges);
 
 void update_cluster_neighbors_p(
@@ -186,7 +239,7 @@ void update_cluster_nn(
 void update_cluster_nn_dist(
     std::vector<Cluster>& clusters,
     const std::vector<int>& active_indices,
-    Eigen::MatrixXd& distance_arr,
+    const SymDistMatrix& dist,
     double max_merge_distance);
 
 std::vector<std::pair<int, int> > find_reciprocal_nn(std::vector<Cluster>& clusters, const std::vector<int>& active_indices);
@@ -215,7 +268,7 @@ void RAC_i(
     std::vector<int>& active_indices,
     double max_merge_distance,
     const int NO_PROCESSORS,
-    Eigen::MatrixXd& distance_arr);
+    SymDistMatrix& dist);
 
 std::vector<int> RAC(
     Eigen::MatrixXd& base_arr,
