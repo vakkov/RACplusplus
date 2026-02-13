@@ -474,10 +474,18 @@ SymDistMatrix calculate_initial_dissimilarities(
     std::vector<int> nn_idx(N, -1);
 
     // Pre-compute squared norms for euclidean distance.
+    // Use same scalar type as tiles so broadcasts don't require conversion.
+#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+    Eigen::VectorXf sq_norms;
+    if (!is_cosine) {
+        sq_norms = base_arr.colwise().squaredNorm().cast<float>();
+    }
+#else
     Eigen::VectorXd sq_norms;
     if (!is_cosine) {
         sq_norms = base_arr.colwise().squaredNorm();
     }
+#endif
 
     // Tiled pairwise distance computation.
     // Only compute upper-triangle tile pairs (j_start >= i_start).
@@ -487,6 +495,10 @@ SymDistMatrix calculate_initial_dissimilarities(
 
         // Block view into base_arr columns [i_start, i_end) — no copy.
         auto Bi = base_arr.block(0, i_start, D, tile_i);
+#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+        // Pre-cast Bi to float once per outer iteration (enables SGEMM).
+        Eigen::MatrixXf Bi_f = Bi.cast<float>();
+#endif
 
         for (int j_start = i_start; j_start < N; j_start += TILE) {
             const int j_end = std::min(j_start + TILE, N);
@@ -495,7 +507,11 @@ SymDistMatrix calculate_initial_dissimilarities(
             auto Bj = base_arr.block(0, j_start, D, tile_j);
 
             // GEMM: tile_i × tile_j. Uses Eigen's internal BLAS threading.
+#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+            Eigen::MatrixXf tile = Bi_f.transpose() * Bj.cast<float>();
+#else
             Eigen::MatrixXd tile = Bi.transpose() * Bj;
+#endif
 
             // Apply distance transform in-place.
             if (is_cosine) {
@@ -1326,6 +1342,9 @@ std::vector<int> RAC(
         auto end = std::chrono::high_resolution_clock::now();
         std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
 
+        // Free base_arr — no longer needed after initial dissimilarities are computed.
+        base_arr.resize(0, 0);
+
         RAC_i(clusters, active_indices, max_merge_distance, NO_PROCESSORS, dist);
     } else {
         std::vector<std::vector<std::pair<int, double>>> merging_arrays(NO_PROCESSORS, std::vector<std::pair<int, double>>(clusters.size()));
@@ -1341,7 +1360,7 @@ std::vector<int> RAC(
     }
 
     // Direct-index label assignment: O(N) instead of O(N log N) sort
-    std::vector<int> cluster_labels(base_arr.cols());
+    std::vector<int> cluster_labels(clusters.size());
     for (int idx : active_indices) {
         const Cluster& cluster = clusters[idx];
         for (int index : cluster.indices) {
