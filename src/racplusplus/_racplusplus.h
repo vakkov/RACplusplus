@@ -31,6 +31,8 @@ extern std::vector<double> UPDATE_PERCENTAGES;
 #ifndef CLUSTER_H
 #define CLUSTER_H
 
+class SymDistMatrix;  // forward declaration
+
 class Cluster {
 public:
     int id;
@@ -95,6 +97,22 @@ public:
                 set(k, col_id, col[k]);
             }
         }
+    }
+
+    // Find minimum value in a "column" without allocating a VectorXd.
+    // Returns (min_value, min_index).
+    std::pair<double, int> min_in_col(int col_id) const {
+        double best_val = std::numeric_limits<double>::infinity();
+        int best_idx = -1;
+        for (int k = 0; k < N; ++k) {
+            if (k == col_id) continue;
+            double v = get(k, col_id);
+            if (v < best_val) {
+                best_val = v;
+                best_idx = k;
+            }
+        }
+        return {best_val, best_idx};
     }
 
     void fill_infinity(int cluster_id) {
@@ -240,7 +258,8 @@ void update_cluster_nn_dist(
     std::vector<Cluster>& clusters,
     const std::vector<int>& active_indices,
     const SymDistMatrix& dist,
-    double max_merge_distance);
+    double max_merge_distance,
+    const int NO_PROCESSORS);
 
 std::vector<std::pair<int, int> > find_reciprocal_nn(std::vector<Cluster>& clusters, const std::vector<int>& active_indices);
 //-----------------------End Updating Nearest Neighbors-----------------------------------

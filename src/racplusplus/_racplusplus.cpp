@@ -135,15 +135,10 @@ void Cluster::update_nn(double max_merge_distance) {
 }
 
 void Cluster::update_nn(const SymDistMatrix& dist, double max_merge_distance) {
-    Eigen::VectorXd col = dist.get_col(this->id);
-    Eigen::Index minRow;
-    col.minCoeff(&minRow);
+    auto [min_val, min_idx] = dist.min_in_col(this->id);
 
-    double min = col[minRow];
-    int nn = static_cast<int>(minRow);
-
-    if (min < max_merge_distance) {
-        this->nn = nn;
+    if (min_val < max_merge_distance) {
+        this->nn = min_idx;
     } else {
         this->nn = -1;
     }
@@ -1025,16 +1020,54 @@ void update_cluster_nn(
 }
 
 // Fix #1: Uses active_indices to iterate only live clusters
+// Now parallelized: each cluster's update_nn is independent (read-only on dist).
 void update_cluster_nn_dist(
     std::vector<Cluster>& clusters,
     const std::vector<int>& active_indices,
     const SymDistMatrix& dist,
-    double max_merge_distance) {
+    double max_merge_distance,
+    const int NO_PROCESSORS) {
+
+    // Collect indices that actually need updating.
+    std::vector<int> needs_update;
+    needs_update.reserve(active_indices.size());
     for (int idx : active_indices) {
         Cluster& cluster = clusters[idx];
-
         if (cluster.will_merge || (cluster.nn != -1 && clusters[cluster.nn].active && clusters[cluster.nn].will_merge)) {
-            cluster.update_nn(dist, max_merge_distance);
+            needs_update.push_back(idx);
+        }
+    }
+
+    if (needs_update.empty()) return;
+
+    auto update_range = [&](size_t start, size_t end) {
+        for (size_t i = start; i < end; i++) {
+            clusters[needs_update[i]].update_nn(dist, max_merge_distance);
+        }
+    };
+
+    size_t count = needs_update.size();
+    size_t requested = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
+    size_t no_threads = std::min(requested, count);
+
+    if (no_threads <= 1) {
+        update_range(0, count);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(no_threads);
+
+        size_t chunk = count / no_threads;
+        size_t remainder = count % no_threads;
+        size_t start = 0;
+
+        for (size_t t = 0; t < no_threads; t++) {
+            size_t end = start + chunk + (t < remainder ? 1 : 0);
+            threads.emplace_back(update_range, start, end);
+            start = end;
+        }
+
+        for (auto& th : threads) {
+            th.join();
         }
     }
 }
@@ -1174,16 +1207,36 @@ void RAC_i(
     SymDistMatrix& dist
     ) {
 
+    long total_dissim = 0, total_nn = 0, total_remove = 0, total_find = 0;
+    int iteration = 0;
+
     std::vector<std::pair<int, int>> merges = find_reciprocal_nn(clusters, active_indices);
     while (merges.size() != 0) {
+        auto t0 = std::chrono::high_resolution_clock::now();
         update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS);
+        auto t1 = std::chrono::high_resolution_clock::now();
 
-        update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance);
+        update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance, NO_PROCESSORS);
+        auto t2 = std::chrono::high_resolution_clock::now();
 
         remove_secondary_clusters(merges, clusters, active_indices);
+        auto t3 = std::chrono::high_resolution_clock::now();
 
         merges = find_reciprocal_nn(clusters, active_indices);
+        auto t4 = std::chrono::high_resolution_clock::now();
+
+        total_dissim += std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        total_nn += std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        total_remove += std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        total_find += std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+        iteration++;
     }
+
+    std::cerr << "RAC_i iterations: " << iteration
+              << " | dissim: " << total_dissim << "ms"
+              << " | nn_dist: " << total_nn << "ms"
+              << " | remove: " << total_remove << "ms"
+              << " | find_rnn: " << total_find << "ms" << std::endl;
 }
 
 // Fix #1: Single entry point with vector<Cluster> (contiguous memory), active_indices, no new/delete
