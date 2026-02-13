@@ -216,7 +216,9 @@ void update_cluster_dissimilarities(
     std::vector<std::pair<int, int> >& merges,
     std::vector<Cluster>& clusters,
     SymDistMatrix& dist,
-    const int NO_PROCESSORS);
+    const int NO_PROCESSORS,
+    std::vector<int>& dsu_parent,
+    std::vector<int>& dsu_size);
 
 SymDistMatrix calculate_initial_dissimilarities(
     Eigen::MatrixXd& base_arr,
@@ -280,7 +282,7 @@ void update_cluster_neighbors(
 
 void update_cluster_neighbors(
     SymDistMatrix& dist,
-    std::vector<std::pair<int, int>> merges);
+    const std::vector<std::pair<int, int>>& merges);
 
 void update_cluster_neighbors_p(
     std::vector<std::pair<int, std::vector<std::pair<int, double> > > >& updates,
@@ -334,10 +336,12 @@ void RAC_i(
     std::vector<int>& active_indices,
     double max_merge_distance,
     const int NO_PROCESSORS,
-    SymDistMatrix& dist);
+    SymDistMatrix& dist,
+    std::vector<int>& dsu_parent,
+    std::vector<int>& dsu_size);
 
 std::vector<int> RAC(
-    Eigen::MatrixXd& base_arr,
+    const Eigen::MatrixXd& base_arr_in,
     double max_merge_distance,
     Eigen::SparseMatrix<bool>* connectivity,
     int batch_size,
@@ -346,7 +350,7 @@ std::vector<int> RAC(
 
 #if !RACPP_BUILDING_LIB_ONLY
 py::array RAC_py(
-    Eigen::MatrixXd base_arr,
+    py::array_t<double, py::array::c_style | py::array::forcecast> base_arr_np,
     double max_merge_distance,
     py::object connectivity,
     int batch_size,
