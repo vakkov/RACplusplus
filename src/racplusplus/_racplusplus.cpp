@@ -355,10 +355,20 @@ void update_cluster_dissimilarities(
         merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
     }
 
+    const int N = dist.N;
+
+    // Pre-allocate all result columns (uninitialized — will be fully written in compute phase).
     std::vector<Eigen::VectorXd> merged_columns(merge_count);
+    for (size_t i = 0; i < merge_count; i++) {
+        merged_columns[i].resize(N);
+    }
 
     auto compute_range = [&](size_t start, size_t end) {
         const double inf = std::numeric_limits<double>::infinity();
+
+        // Thread-local scratch buffers — reused across merges, no per-merge allocation.
+        Eigen::VectorXd main_col(N);
+        Eigen::VectorXd sec_col(N);
 
         for (size_t i = start; i < end; i++) {
             const int main_id = merge_main_ids[i];
@@ -368,10 +378,12 @@ void update_cluster_dissimilarities(
             const double secondary_size = merge_secondary_sizes[i];
             const double inv_ab = merge_inv_sizes[i];
 
-            // Base: average-linkage merge for (main, secondary) against all clusters.
-            Eigen::VectorXd main_col = dist.get_col(main_id);
-            Eigen::VectorXd sec_col = dist.get_col(secondary_id);
-            Eigen::VectorXd avg_col = (main_size * main_col + secondary_size * sec_col) * inv_ab;
+            // Fill scratch buffers (no allocation).
+            dist.get_col_into(main_id, main_col);
+            dist.get_col_into(secondary_id, sec_col);
+
+            // Compute directly into pre-allocated merged_columns[i].
+            merged_columns[i].noalias() = (main_size * main_col + secondary_size * sec_col) * inv_ab;
 
             // Patch entries for other merges so distances reflect their merged clusters (not their pre-merge constituents).
             for (size_t j = 0; j < merge_count; j++) {
@@ -393,14 +405,12 @@ void update_cluster_dissimilarities(
                     inv_cd;
 
                 const double dist_ab_to_cd = (main_size * dist_main_to_cd + secondary_size * dist_secondary_to_cd) * inv_ab;
-                avg_col[merge_main] = dist_ab_to_cd;
-                avg_col[merge_secondary] = dist_ab_to_cd;
+                merged_columns[i][merge_main] = dist_ab_to_cd;
+                merged_columns[i][merge_secondary] = dist_ab_to_cd;
             }
 
-            avg_col[main_id] = inf;
-            avg_col[secondary_id] = inf;
-
-            merged_columns[i] = std::move(avg_col);
+            merged_columns[i][main_id] = inf;
+            merged_columns[i][secondary_id] = inf;
         }
     };
 

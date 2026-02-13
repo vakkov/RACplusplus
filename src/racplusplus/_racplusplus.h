@@ -85,42 +85,82 @@ public:
 
     Eigen::VectorXd get_col(int col_id) const {
         Eigen::VectorXd col(N);
-        for (int k = 0; k < N; ++k) {
-            col[k] = get(k, col_id);
-        }
+        get_col_into(col_id, col);
         return col;
     }
 
+    // Fill an existing VectorXd (must already be size N) — no heap allocation.
+    void get_col_into(int col_id, Eigen::VectorXd& col) const {
+        // k < col_id: scattered access with decreasing stride
+        for (int k = 0; k < col_id; ++k) {
+            col[k] = data[tri_idx(k, col_id)];
+        }
+        col[col_id] = std::numeric_limits<double>::infinity();
+        // k > col_id: contiguous access starting at tri_idx(col_id, col_id+1)
+        if (col_id + 1 < N) {
+            size_t base = tri_idx(col_id, col_id + 1);
+            for (int k = col_id + 1; k < N; ++k) {
+                col[k] = data[base + (k - col_id - 1)];
+            }
+        }
+    }
+
     void set_col(int col_id, const Eigen::VectorXd& col) {
-        for (int k = 0; k < N; ++k) {
-            if (k != col_id) {
-                set(k, col_id, col[k]);
+        // k < col_id: scattered access
+        for (int k = 0; k < col_id; ++k) {
+            data[tri_idx(k, col_id)] = col[k];
+        }
+        // k > col_id: contiguous access
+        if (col_id + 1 < N) {
+            size_t base = tri_idx(col_id, col_id + 1);
+            for (int k = col_id + 1; k < N; ++k) {
+                data[base + (k - col_id - 1)] = col[k];
             }
         }
     }
 
     // Find minimum value in a "column" without allocating a VectorXd.
     // Returns (min_value, min_index).
+    // Uses split-loop to avoid branch per element and exploit contiguous access for k > col_id.
     std::pair<double, int> min_in_col(int col_id) const {
         double best_val = std::numeric_limits<double>::infinity();
         int best_idx = -1;
-        for (int k = 0; k < N; ++k) {
-            if (k == col_id) continue;
-            double v = get(k, col_id);
+
+        // k < col_id: scattered access
+        for (int k = 0; k < col_id; ++k) {
+            double v = data[tri_idx(k, col_id)];
             if (v < best_val) {
                 best_val = v;
                 best_idx = k;
             }
         }
+
+        // k > col_id: contiguous access
+        if (col_id + 1 < N) {
+            size_t base = tri_idx(col_id, col_id + 1);
+            for (int k = col_id + 1; k < N; ++k) {
+                double v = data[base + (k - col_id - 1)];
+                if (v < best_val) {
+                    best_val = v;
+                    best_idx = k;
+                }
+            }
+        }
+
         return {best_val, best_idx};
     }
 
     void fill_infinity(int cluster_id) {
         const double inf = std::numeric_limits<double>::infinity();
-        for (int k = 0; k < N; ++k) {
-            if (k != cluster_id) {
-                set(k, cluster_id, inf);
-            }
+        // k < cluster_id: scattered access
+        for (int k = 0; k < cluster_id; ++k) {
+            data[tri_idx(k, cluster_id)] = inf;
+        }
+        // k > cluster_id: contiguous access
+        if (cluster_id + 1 < N) {
+            size_t base = tri_idx(cluster_id, cluster_id + 1);
+            size_t count = static_cast<size_t>(N - cluster_id - 1);
+            std::fill_n(data.data() + base, count, inf);
         }
     }
 };
