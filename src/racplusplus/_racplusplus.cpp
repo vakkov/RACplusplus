@@ -452,49 +452,83 @@ SymDistMatrix calculate_initial_dissimilarities(
     double max_merge_distance,
     std::string distance_metric) {
 
-    Eigen::MatrixXd distance_mat;
-    if (distance_metric == "cosine") {
-        distance_mat = pairwise_cosine(base_arr, base_arr);
-    } else {
-        distance_mat = pairwise_euclidean(base_arr, base_arr);
-    }
-
     const int N = static_cast<int>(clusters.size());
+    const int D = static_cast<int>(base_arr.rows());
+    const int TILE = 4096;
+    const bool is_cosine = (distance_metric == "cosine");
+
     SymDistMatrix dist(N);
 
-    // Copy upper triangle from full matrix into compact storage and find NNs.
-    for (int i = 0; i < N; i++) {
-        double min = std::numeric_limits<double>::infinity();
-        int nn = -1;
+    // Per-cluster NN tracking.
+    std::vector<double> nn_best(N, std::numeric_limits<double>::infinity());
+    std::vector<int> nn_idx(N, -1);
 
-        Cluster& currentCluster = clusters[i];
+    // Pre-compute squared norms for euclidean distance.
+    Eigen::VectorXd sq_norms;
+    if (!is_cosine) {
+        sq_norms = base_arr.colwise().squaredNorm();
+    }
 
-        for (int j = 0; j < N; j++) {
-            if (i == j) {
-                continue;
+    // Tiled pairwise distance computation.
+    // Only compute upper-triangle tile pairs (j_start >= i_start).
+    for (int i_start = 0; i_start < N; i_start += TILE) {
+        const int i_end = std::min(i_start + TILE, N);
+        const int tile_i = i_end - i_start;
+
+        // Block view into base_arr columns [i_start, i_end) — no copy.
+        auto Bi = base_arr.block(0, i_start, D, tile_i);
+
+        for (int j_start = i_start; j_start < N; j_start += TILE) {
+            const int j_end = std::min(j_start + TILE, N);
+            const int tile_j = j_end - j_start;
+
+            auto Bj = base_arr.block(0, j_start, D, tile_j);
+
+            // GEMM: tile_i × tile_j. Uses Eigen's internal BLAS threading.
+            Eigen::MatrixXd tile = Bi.transpose() * Bj;
+
+            // Apply distance transform in-place.
+            if (is_cosine) {
+                tile = (-tile).array() + 1.0;
+            } else {
+                tile *= -2.0;
+                for (int r = 0; r < tile_i; r++) {
+                    tile.row(r).array() += sq_norms[i_start + r];
+                }
+                for (int c = 0; c < tile_j; c++) {
+                    tile.col(c).array() += sq_norms[j_start + c];
+                }
+                tile = tile.array().max(0.0).sqrt();
             }
 
-            double distance = distance_mat(i, j);
+            // Store to SymDistMatrix + track NNs.
+            for (int r = 0; r < tile_i; r++) {
+                const int i_global = i_start + r;
+                for (int c = 0; c < tile_j; c++) {
+                    const int j_global = j_start + c;
+                    if (i_global >= j_global) continue;
 
-            // Store only upper triangle (i < j) to avoid double-writing.
-            if (i < j) {
-                dist.set(i, j, distance);
-            }
+                    const double val = tile(r, c);
+                    dist.data[dist.tri_idx(i_global, j_global)] = val;
 
-            if (distance < max_merge_distance) {
-                currentCluster.neighbors.push_back(j);
-
-                if (distance < min) {
-                    min = distance;
-                    nn = j;
+                    if (val < nn_best[i_global]) {
+                        nn_best[i_global] = val;
+                        nn_idx[i_global] = j_global;
+                    }
+                    if (val < nn_best[j_global]) {
+                        nn_best[j_global] = val;
+                        nn_idx[j_global] = i_global;
+                    }
                 }
             }
         }
-
-        currentCluster.nn = nn;
     }
 
-    // Full Eigen matrix goes out of scope here, freeing N*N doubles.
+    // Set cluster NNs.
+    for (int k = 0; k < N; k++) {
+        clusters[k].nn = (nn_best[k] < max_merge_distance) ? nn_idx[k] : -1;
+    }
+
     return dist;
 }
 
