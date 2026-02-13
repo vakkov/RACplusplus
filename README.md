@@ -18,10 +18,14 @@ Based on the paper:
 ```
 
 ## Build
+```
 python3 -m pip wheel . -w dist
+```
 
 ## Float32 build
+```
 rm -rf _skbuild && python3 -m pip install /home/gpu/racplusplus --config-settings=cmake.args=-DRACPP_SYMDIST_USE_FLOAT=ON
+```
 
 ## Contributors
 
