@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(racplusplus VERSION "0.0.5")
 message(STATUS "CC: $ENV{CC}")
 message(STATUS "CXX: $ENV{CXX}")
+option(RACPP_SYMDIST_USE_FLOAT "Store SymDistMatrix values as float32 instead of float64" OFF)
 
 # Set the OpenMP flags here
 if(DEFINED ENV{OpenMP_LIBRARY})
@@ -73,6 +74,14 @@ set(python_module_name _racplusplus)
 pybind11_add_module(${python_module_name} MODULE
      src/racplusplus/_racplusplus.cpp
     )
+
+if (RACPP_SYMDIST_USE_FLOAT)
+  target_compile_definitions(${python_module_name} PRIVATE RACPP_SYMDIST_USE_FLOAT=1)
+  message(STATUS "SymDistMatrix storage precision: float32")
+else()
+  target_compile_definitions(${python_module_name} PRIVATE RACPP_SYMDIST_USE_FLOAT=0)
+  message(STATUS "SymDistMatrix storage precision: float64")
+endif()
 
 #-----------------------------------Link Libraries-------------------------------------
 if (MSVC)

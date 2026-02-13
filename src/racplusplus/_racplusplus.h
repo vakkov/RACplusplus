@@ -7,6 +7,7 @@
 #include <vector>
 #include <set>
 #include <limits>
+#include <algorithm>
 #include "Eigen/Dense"
 #include "Eigen/Sparse"
 
@@ -56,14 +57,20 @@ public:
 #ifndef SYMDISTMATRIX_H
 #define SYMDISTMATRIX_H
 
+#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+using SymDistScalar = float;
+#else
+using SymDistScalar = double;
+#endif
+
 class SymDistMatrix {
 public:
     int N;
-    std::vector<double> data;
+    std::vector<SymDistScalar> data;
 
     explicit SymDistMatrix(int n)
         : N(n), data(static_cast<size_t>(n) * (n - 1) / 2,
-               std::numeric_limits<double>::infinity()) {}
+               std::numeric_limits<SymDistScalar>::infinity()) {}
 
     inline size_t tri_idx(int i, int j) const {
         return static_cast<size_t>(i) * N
@@ -74,13 +81,13 @@ public:
     inline double get(int i, int j) const {
         if (i == j) return std::numeric_limits<double>::infinity();
         if (i > j) std::swap(i, j);
-        return data[tri_idx(i, j)];
+        return static_cast<double>(data[tri_idx(i, j)]);
     }
 
     inline void set(int i, int j, double val) {
         if (i == j) return;
         if (i > j) std::swap(i, j);
-        data[tri_idx(i, j)] = val;
+        data[tri_idx(i, j)] = static_cast<SymDistScalar>(val);
     }
 
     Eigen::VectorXd get_col(int col_id) const {
@@ -93,14 +100,14 @@ public:
     void get_col_into(int col_id, Eigen::VectorXd& col) const {
         // k < col_id: scattered access with decreasing stride
         for (int k = 0; k < col_id; ++k) {
-            col[k] = data[tri_idx(k, col_id)];
+            col[k] = static_cast<double>(data[tri_idx(k, col_id)]);
         }
         col[col_id] = std::numeric_limits<double>::infinity();
         // k > col_id: contiguous access starting at tri_idx(col_id, col_id+1)
         if (col_id + 1 < N) {
             size_t base = tri_idx(col_id, col_id + 1);
             for (int k = col_id + 1; k < N; ++k) {
-                col[k] = data[base + (k - col_id - 1)];
+                col[k] = static_cast<double>(data[base + (k - col_id - 1)]);
             }
         }
     }
@@ -108,13 +115,13 @@ public:
     void set_col(int col_id, const Eigen::VectorXd& col) {
         // k < col_id: scattered access
         for (int k = 0; k < col_id; ++k) {
-            data[tri_idx(k, col_id)] = col[k];
+            data[tri_idx(k, col_id)] = static_cast<SymDistScalar>(col[k]);
         }
         // k > col_id: contiguous access
         if (col_id + 1 < N) {
             size_t base = tri_idx(col_id, col_id + 1);
             for (int k = col_id + 1; k < N; ++k) {
-                data[base + (k - col_id - 1)] = col[k];
+                data[base + (k - col_id - 1)] = static_cast<SymDistScalar>(col[k]);
             }
         }
     }
@@ -128,7 +135,7 @@ public:
 
         // k < col_id: scattered access
         for (int k = 0; k < col_id; ++k) {
-            double v = data[tri_idx(k, col_id)];
+            double v = static_cast<double>(data[tri_idx(k, col_id)]);
             if (v < best_val) {
                 best_val = v;
                 best_idx = k;
@@ -139,7 +146,7 @@ public:
         if (col_id + 1 < N) {
             size_t base = tri_idx(col_id, col_id + 1);
             for (int k = col_id + 1; k < N; ++k) {
-                double v = data[base + (k - col_id - 1)];
+                double v = static_cast<double>(data[base + (k - col_id - 1)]);
                 if (v < best_val) {
                     best_val = v;
                     best_idx = k;
@@ -151,7 +158,7 @@ public:
     }
 
     void fill_infinity(int cluster_id) {
-        const double inf = std::numeric_limits<double>::infinity();
+        const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
         // k < cluster_id: scattered access
         for (int k = 0; k < cluster_id; ++k) {
             data[tri_idx(k, cluster_id)] = inf;

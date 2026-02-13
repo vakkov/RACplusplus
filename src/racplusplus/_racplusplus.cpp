@@ -1482,6 +1482,11 @@ PYBIND11_MODULE(_racplusplus, m){
     )fdoc");
 
     m.attr("__version__") = "0.9";
+#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+    m.attr("__symdist_storage__") = "float32";
+#else
+    m.attr("__symdist_storage__") = "float64";
+#endif
 }
 //------------------------END PYBIND INTERFACE----------------------------------
 #endif
