@@ -24,6 +24,7 @@ namespace py = pybind11;
 #include "Eigen/Sparse"
 #include <random>
 #include <numeric>
+#include <cmath>
 
 #include "_racplusplus.h"
 
@@ -259,6 +260,7 @@ std::vector<std::pair<int, std::vector<std::pair<int, double>>>> consolidate_ind
         int secondary = merge.second;
 
         clusters[main].indices.insert(clusters[main].indices.end(), clusters[secondary].indices.begin(), clusters[secondary].indices.end());
+        clusters[secondary].indices.clear();
 
         for (size_t i=0; i < clusters[main].neighbors_needing_updates.size(); i++) {
             int neighbor_idx = std::get<1>(clusters[main].neighbors_needing_updates[i]);
@@ -565,43 +567,53 @@ void calculate_initial_dissimilarities(
     int batch_size,
     std::string distance_metric) {
 
-    int clustersSize = static_cast<int>(clusters.size());
+    const bool is_cosine = (distance_metric == "cosine");
+    const int clustersSize = static_cast<int>(clusters.size());
+
+    Eigen::VectorXd sq_norms;
+    if (!is_cosine) {
+        sq_norms = base_arr.colwise().squaredNorm();
+    }
+
     for (int batchStart = 0; batchStart < clustersSize; batchStart += batch_size) {
         int batchEnd = std::min(batchStart + batch_size, clustersSize);
-        Eigen::MatrixXd batch = base_arr.block(0, clusters[batchStart].indices[0], base_arr.rows(), clusters[batchEnd - 1].indices[0] - clusters[batchStart].indices[0] + 1);
-
-        Eigen::MatrixXd distance_mat;
-        if (distance_metric == "cosine") {
-            distance_mat = pairwise_cosine(base_arr, batch);
-        } else {
-            distance_mat = pairwise_euclidean(base_arr, batch);
-        }
 
         for (int i = batchStart; i < batchEnd; ++i) {
             Cluster& cluster = clusters[i];
-            Eigen::VectorXd distance_vec = distance_mat.col(i - batchStart);
+            auto base_col = base_arr.col(i);
 
             std::vector<std::pair<int, double>> neighbors;
 
             int nearest_neighbor = -1;
             double min = std::numeric_limits<double>::infinity();
 
-            Eigen::SparseVector<bool> cluster_column = connectivity.innerVector(i);
-            for (Eigen::SparseVector<bool>::InnerIterator it(cluster_column); it; ++it) {
+            for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
                 int j = it.index();
                 bool value = it.value();
 
                 if (j != i && value) {
-                    neighbors.push_back(std::make_pair(j, distance_vec[j]));
+                    const double dot = base_col.dot(base_arr.col(j));
+                    double distance = 0.0;
+                    if (is_cosine) {
+                        distance = 1.0 - dot;
+                    } else {
+                        double sq_dist = sq_norms[i] + sq_norms[j] - 2.0 * dot;
+                        if (sq_dist < 0.0) {
+                            sq_dist = 0.0;
+                        }
+                        distance = std::sqrt(sq_dist);
+                    }
 
-                    if (distance_vec[j] < min && distance_vec[j] < max_merge_distance) {
-                        min = distance_vec[j];
+                    neighbors.push_back(std::make_pair(j, distance));
+
+                    if (distance < min && distance < max_merge_distance) {
+                        min = distance;
                         nearest_neighbor = j;
                     }
                 }
             }
 
-            cluster.neighbor_distances = neighbors;
+            cluster.neighbor_distances = std::move(neighbors);
             cluster.nn = nearest_neighbor;
         }
     }
