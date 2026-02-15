@@ -351,10 +351,38 @@ void update_cluster_dissimilarities(
         NO_PROCESSORS);
 }
 
+static inline size_t choose_merge_batch_size(int n, size_t requested_threads) {
+    // Target workspace budget for merged columns:
+    //   batch_size * N * sizeof(SymDistScalar)
+    // Keep this bounded to reduce memory pressure/cache thrash at large N.
+    constexpr size_t TARGET_WORKSPACE_BYTES = 256ull * 1024ull * 1024ull; // 256 MB
+    constexpr size_t MIN_BATCH = 128;
+    constexpr size_t MAX_BATCH = 1024;
+
+    const size_t n_safe = std::max<size_t>(1, static_cast<size_t>(n));
+    const size_t bytes_per_col = n_safe * sizeof(SymDistScalar);
+    size_t by_memory = TARGET_WORKSPACE_BYTES / bytes_per_col;
+    if (by_memory == 0) by_memory = 1;
+
+    size_t batch = std::clamp(by_memory, MIN_BATCH, MAX_BATCH);
+
+    // Keep enough work granularity for threading.
+    const size_t min_for_threads = std::max<size_t>(MIN_BATCH, requested_threads * 8);
+    if (batch < min_for_threads) {
+        batch = std::min(MAX_BATCH, min_for_threads);
+    }
+
+    // Round down to cache-friendly multiple.
+    if (batch >= 32) {
+        batch = (batch / 32) * 32;
+    }
+    return std::max<size_t>(1, batch);
+}
+
 // Fix #2: Two-phase full-matrix merge to avoid data races on shared distance_arr.
 // Phase 1 computes updated columns in parallel (read-only), phase 2 writes back serially.
-// Merges are processed in batches to cap peak memory — each batch pre-allocates at most
-// MERGE_BATCH columns (≈480 MB for 60k) instead of one per merge (could be 4+ GB).
+// Merges are processed in adaptive batches to cap peak memory — each batch pre-allocates
+// at most MERGE_BATCH columns instead of one per merge.
 // Cross-batch interactions are handled by the updated dist; intra-batch by the patch.
 void update_cluster_dissimilarities(
     std::vector<std::pair<int, int> >& merges,
@@ -372,8 +400,8 @@ void update_cluster_dissimilarities(
 
     const size_t merge_count = merges.size();
     const int N = dist.N;
-    const size_t MERGE_BATCH = 1024;
     const size_t requested_threads = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
+    const size_t MERGE_BATCH = choose_merge_batch_size(N, requested_threads);
 
     auto& merged_columns = merged_columns_workspace;
     const size_t max_batch = std::min(merge_count, MERGE_BATCH);
@@ -386,10 +414,15 @@ void update_cluster_dissimilarities(
         }
     }
 
-    // Persistent mask for batch secondaries (item 6).
-    static std::vector<char> is_batch_secondary;
-    if (static_cast<int>(is_batch_secondary.size()) < N) {
-        is_batch_secondary.assign(N, 0);
+    // Persistent mask for secondaries in this whole merge iteration.
+    // Needed because last-batch main NN refresh must skip all secondaries,
+    // including those from earlier batches.
+    static std::vector<char> is_iter_secondary;
+    if (static_cast<int>(is_iter_secondary.size()) < N) {
+        is_iter_secondary.assign(N, 0);
+    }
+    for (const auto& merge : merges) {
+        is_iter_secondary[merge.second] = 1;
     }
 
     for (size_t batch_start = 0; batch_start < merge_count; batch_start += MERGE_BATCH) {
@@ -522,10 +555,6 @@ void update_cluster_dissimilarities(
         const bool is_last_batch = (batch_end >= merge_count);
         if (is_last_batch) {
             for (size_t i = 0; i < batch_size; i++) {
-                is_batch_secondary[merge_secondary_ids[i]] = 1;
-            }
-
-            for (size_t i = 0; i < batch_size; i++) {
                 const int main_id = merge_main_ids[i];
                 const SymDistScalar* col_data = merged_columns[i].data();
                 SymDistScalar best_val = std::numeric_limits<SymDistScalar>::infinity();
@@ -533,7 +562,7 @@ void update_cluster_dissimilarities(
 
                 for (int k = 0; k < N; k++) {
                     if (!clusters[k].active) continue;
-                    if (is_batch_secondary[k]) continue;
+                    if (is_iter_secondary[k]) continue;
                     if (col_data[k] < best_val) {
                         best_val = col_data[k];
                         best_idx = k;
@@ -543,11 +572,11 @@ void update_cluster_dissimilarities(
                 clusters[main_id].nn =
                     (static_cast<double>(best_val) < max_merge_distance) ? best_idx : -1;
             }
-
-            for (size_t i = 0; i < batch_size; i++) {
-                is_batch_secondary[merge_secondary_ids[i]] = 0;
-            }
         }
+    }
+
+    for (const auto& merge : merges) {
+        is_iter_secondary[merge.second] = 0;
     }
 }
 
@@ -1243,8 +1272,9 @@ void update_cluster_nn_dist(
     if (static_cast<int>(is_dead_ws.size()) < N) is_dead_ws.assign(N, 0);
     if (static_cast<int>(is_changed_ws.size()) < N) is_changed_ws.assign(N, 0);
 
-    // Last-batch boundary (must match MERGE_BATCH in update_cluster_dissimilarities).
-    const size_t MERGE_BATCH = 1024;
+    // Last-batch boundary (must match batching in update_cluster_dissimilarities).
+    const size_t requested = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
+    const size_t MERGE_BATCH = choose_merge_batch_size(N, requested);
     const size_t last_batch_start =
         ((merges.size() - 1) / MERGE_BATCH) * MERGE_BATCH;
 
@@ -1322,7 +1352,6 @@ void update_cluster_nn_dist(
     };
 
     const size_t count = needs_rescan.size();
-    const size_t requested = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
     const size_t no_threads = std::min(requested, count);
 
     if (no_threads <= 1) {
