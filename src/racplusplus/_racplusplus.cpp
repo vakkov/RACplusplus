@@ -342,7 +342,8 @@ void update_cluster_dissimilarities(
     SymDistMatrix& dist,
     const int NO_PROCESSORS,
     std::vector<int>& dsu_parent,
-    std::vector<int>& dsu_size) {
+    std::vector<int>& dsu_size,
+    std::vector<SymDistVector>& merged_columns_workspace) {
 
     if (merges.empty()) {
         return;
@@ -352,11 +353,16 @@ void update_cluster_dissimilarities(
     const int N = dist.N;
     const size_t MERGE_BATCH = 1024;
 
-    // Pre-allocate reusable column buffers — capped at MERGE_BATCH.
+    // Reusable column buffers (persist across RAC iterations for this RAC invocation).
+    auto& merged_columns = merged_columns_workspace;
     const size_t max_batch = std::min(merge_count, MERGE_BATCH);
-    std::vector<Eigen::VectorXd> merged_columns(max_batch);
+    if (merged_columns.size() < max_batch) {
+        merged_columns.resize(max_batch);
+    }
     for (size_t i = 0; i < max_batch; i++) {
-        merged_columns[i].resize(N);
+        if (merged_columns[i].size() != N) {
+            merged_columns[i].resize(N);
+        }
     }
 
     for (size_t batch_start = 0; batch_start < merge_count; batch_start += MERGE_BATCH) {
@@ -384,9 +390,9 @@ void update_cluster_dissimilarities(
 
         // Parallel compute for this batch.
         auto compute_range = [&](size_t start, size_t end) {
-            const double inf = std::numeric_limits<double>::infinity();
-            Eigen::VectorXd main_col(N);
-            Eigen::VectorXd sec_col(N);
+            const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
+            SymDistVector main_col(N);
+            SymDistVector sec_col(N);
 
             for (size_t i = start; i < end; i++) {
                 const int main_id = merge_main_ids[i];
@@ -394,10 +400,12 @@ void update_cluster_dissimilarities(
                 const double main_size = merge_main_sizes[i];
                 const double secondary_size = merge_secondary_sizes[i];
                 const double inv_ab = merge_inv_sizes[i];
+                const SymDistScalar main_weight = static_cast<SymDistScalar>(main_size * inv_ab);
+                const SymDistScalar secondary_weight = static_cast<SymDistScalar>(secondary_size * inv_ab);
 
                 dist.get_col_into(main_id, main_col);
                 dist.get_col_into(secondary_id, sec_col);
-                merged_columns[i].noalias() = (main_size * main_col + secondary_size * sec_col) * inv_ab;
+                merged_columns[i].noalias() = main_weight * main_col + secondary_weight * sec_col;
 
                 // Patch: only for other merges within THIS batch.
                 // Cross-batch merges are already reflected in dist from earlier write-backs.
@@ -416,8 +424,9 @@ void update_cluster_dissimilarities(
                          merge_secondary_sizes[j] * dist.get(merge_secondary, secondary_id)) * inv_cd;
 
                     const double dist_ab_to_cd = (main_size * dist_main_to_cd + secondary_size * dist_secondary_to_cd) * inv_ab;
-                    merged_columns[i][merge_main] = dist_ab_to_cd;
-                    merged_columns[i][merge_secondary] = dist_ab_to_cd;
+                    const SymDistScalar dist_val = static_cast<SymDistScalar>(dist_ab_to_cd);
+                    merged_columns[i][merge_main] = dist_val;
+                    merged_columns[i][merge_secondary] = dist_val;
                 }
 
                 merged_columns[i][main_id] = inf;
@@ -457,11 +466,12 @@ void update_cluster_dissimilarities(
     }
 }
 
-SymDistMatrix calculate_initial_dissimilarities(
-    Eigen::MatrixXd& base_arr,
+template <typename Scalar>
+static SymDistMatrix calculate_initial_dissimilarities_dense(
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& base_arr,
     std::vector<Cluster>& clusters,
     double max_merge_distance,
-    std::string distance_metric) {
+    const std::string& distance_metric) {
 
     const int N = static_cast<int>(clusters.size());
     const int D = static_cast<int>(base_arr.rows());
@@ -474,19 +484,10 @@ SymDistMatrix calculate_initial_dissimilarities(
     std::vector<double> nn_best(N, std::numeric_limits<double>::infinity());
     std::vector<int> nn_idx(N, -1);
 
-    // Pre-compute squared norms for euclidean distance.
-    // Use same scalar type as tiles so broadcasts don't require conversion.
-#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
-    Eigen::VectorXf sq_norms;
-    if (!is_cosine) {
-        sq_norms = base_arr.colwise().squaredNorm().cast<float>();
-    }
-#else
-    Eigen::VectorXd sq_norms;
+    Eigen::Matrix<Scalar, 1, Eigen::Dynamic> sq_norms;
     if (!is_cosine) {
         sq_norms = base_arr.colwise().squaredNorm();
     }
-#endif
 
     // Tiled pairwise distance computation.
     // Only compute upper-triangle tile pairs (j_start >= i_start).
@@ -494,49 +495,37 @@ SymDistMatrix calculate_initial_dissimilarities(
         const int i_end = std::min(i_start + TILE, N);
         const int tile_i = i_end - i_start;
 
-        // Block view into base_arr columns [i_start, i_end) — no copy.
         auto Bi = base_arr.block(0, i_start, D, tile_i);
-#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
-        // Pre-cast Bi to float once per outer iteration (enables SGEMM).
-        Eigen::MatrixXf Bi_f = Bi.cast<float>();
-#endif
 
         for (int j_start = i_start; j_start < N; j_start += TILE) {
             const int j_end = std::min(j_start + TILE, N);
             const int tile_j = j_end - j_start;
 
             auto Bj = base_arr.block(0, j_start, D, tile_j);
+            Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> tile = Bi.transpose() * Bj;
 
-            // GEMM: tile_i × tile_j. Uses Eigen's internal BLAS threading.
-#if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
-            Eigen::MatrixXf tile = Bi_f.transpose() * Bj.cast<float>();
-#else
-            Eigen::MatrixXd tile = Bi.transpose() * Bj;
-#endif
-
-            // Apply distance transform in-place.
             if (is_cosine) {
-                tile = (-tile).array() + 1.0;
+                tile = (Scalar(1) - tile.array()).matrix();
             } else {
-                tile *= -2.0;
+                tile *= Scalar(-2);
                 for (int r = 0; r < tile_i; r++) {
                     tile.row(r).array() += sq_norms[i_start + r];
                 }
                 for (int c = 0; c < tile_j; c++) {
                     tile.col(c).array() += sq_norms[j_start + c];
                 }
-                tile = tile.array().max(0.0).sqrt();
+                tile = tile.array().max(Scalar(0)).sqrt().matrix();
             }
 
-            // Store to SymDistMatrix + track NNs.
             for (int r = 0; r < tile_i; r++) {
                 const int i_global = i_start + r;
                 for (int c = 0; c < tile_j; c++) {
                     const int j_global = j_start + c;
                     if (i_global >= j_global) continue;
 
-                    const double val = tile(r, c);
-                    dist.data[dist.tri_idx(i_global, j_global)] = val;
+                    const Scalar raw_val = tile(r, c);
+                    const double val = static_cast<double>(raw_val);
+                    dist.data[dist.tri_idx(i_global, j_global)] = static_cast<SymDistScalar>(raw_val);
 
                     if (val < nn_best[i_global]) {
                         nn_best[i_global] = val;
@@ -551,12 +540,19 @@ SymDistMatrix calculate_initial_dissimilarities(
         }
     }
 
-    // Set cluster NNs.
     for (int k = 0; k < N; k++) {
         clusters[k].nn = (nn_best[k] < max_merge_distance) ? nn_idx[k] : -1;
     }
 
     return dist;
+}
+
+SymDistMatrix calculate_initial_dissimilarities(
+    Eigen::MatrixXd& base_arr,
+    std::vector<Cluster>& clusters,
+    double max_merge_distance,
+    std::string distance_metric) {
+    return calculate_initial_dissimilarities_dense(base_arr, clusters, max_merge_distance, distance_metric);
 }
 
 void calculate_initial_dissimilarities(
@@ -1297,11 +1293,12 @@ void RAC_i(
 
     long total_dissim = 0, total_nn = 0, total_remove = 0, total_find = 0;
     int iteration = 0;
+    std::vector<SymDistVector> merged_columns_workspace;
 
     std::vector<std::pair<int, int>> merges = find_reciprocal_nn(clusters, active_indices);
     while (merges.size() != 0) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS, dsu_parent, dsu_size);
+        update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS, dsu_parent, dsu_size, merged_columns_workspace);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance, NO_PROCESSORS);
@@ -1327,6 +1324,49 @@ void RAC_i(
               << " | find_rnn: " << total_find << "ms" << std::endl;
 }
 
+template <typename Scalar>
+static std::vector<int> RAC_impl_no_connectivity(
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& base_arr,
+    double max_merge_distance,
+    int no_processors,
+    const std::string& distance_metric) {
+
+    const int NO_PROCESSORS = (no_processors != 0) ? no_processors : getProcessorCount();
+    const int N = static_cast<int>(base_arr.cols());
+    Eigen::setNbThreads(NO_PROCESSORS);
+
+    std::vector<Cluster> clusters;
+    clusters.reserve(N);
+    std::vector<int> active_indices;
+    active_indices.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        clusters.emplace_back(i);
+        active_indices.push_back(i);
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    SymDistMatrix dist = calculate_initial_dissimilarities_dense(base_arr, clusters, max_merge_distance, distance_metric);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+
+    // Free base_arr — no longer needed after initial dissimilarities are computed.
+    base_arr.resize(0, 0);
+
+    // DSU for O(1) merges and O(N) label assignment
+    std::vector<int> dsu_parent(N);
+    std::iota(dsu_parent.begin(), dsu_parent.end(), 0);
+    std::vector<int> dsu_size(N, 1);
+
+    RAC_i(clusters, active_indices, max_merge_distance, NO_PROCESSORS, dist, dsu_parent, dsu_size);
+
+    // Label assignment via DSU: O(N α(N)) ≈ O(N)
+    std::vector<int> cluster_labels(N);
+    for (int i = 0; i < N; i++) {
+        cluster_labels[i] = dsu_find(dsu_parent, i);
+    }
+    return cluster_labels;
+}
+
 // Internal implementation: expects D×N column-major data (already transposed + normalized).
 static std::vector<int> RAC_impl(
     Eigen::MatrixXd& base_arr,
@@ -1335,6 +1375,10 @@ static std::vector<int> RAC_impl(
     int batch_size,
     int no_processors,
     std::string distance_metric) {
+
+    if (connectivity == nullptr) {
+        return RAC_impl_no_connectivity(base_arr, max_merge_distance, no_processors, distance_metric);
+    }
 
     const int NO_PROCESSORS = (no_processors != 0) ? no_processors : getProcessorCount();
     const int N = static_cast<int>(base_arr.cols());
@@ -1353,52 +1397,29 @@ static std::vector<int> RAC_impl(
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    if (connectivity == nullptr) {
-        SymDistMatrix dist = calculate_initial_dissimilarities(base_arr, clusters, max_merge_distance, distance_metric);
-        auto end = std::chrono::high_resolution_clock::now();
-        std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+    std::vector<std::vector<std::pair<int, double>>> merging_arrays(NO_PROCESSORS, std::vector<std::pair<int, double>>(clusters.size()));
+    std::vector<int> sort_neighbor_arr(clusters.size(), -1);
+    std::vector<std::vector<int>> update_neighbors_arrays(NO_PROCESSORS, std::vector<int>(clusters.size()));
+    std::vector<int> nn_count(clusters.size(), 0);
 
-        // Free base_arr — no longer needed after initial dissimilarities are computed.
-        base_arr.resize(0, 0);
+    calculate_initial_dissimilarities(base_arr, clusters, *connectivity, max_merge_distance, BATCHSIZE, distance_metric);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
 
-        // DSU for O(1) merges and O(N) label assignment
-        std::vector<int> dsu_parent(N);
-        std::iota(dsu_parent.begin(), dsu_parent.end(), 0);
-        std::vector<int> dsu_size(N, 1);
+    // Free base_arr — no longer needed after initial dissimilarities are computed.
+    base_arr.resize(0, 0);
 
-        RAC_i(clusters, active_indices, max_merge_distance, NO_PROCESSORS, dist, dsu_parent, dsu_size);
+    RAC_i(clusters, active_indices, max_merge_distance, NO_PROCESSORS, merging_arrays, sort_neighbor_arr, update_neighbors_arrays, nn_count);
 
-        // Label assignment via DSU: O(N α(N)) ≈ O(N)
-        std::vector<int> cluster_labels(N);
-        for (int i = 0; i < N; i++) {
-            cluster_labels[i] = dsu_find(dsu_parent, i);
+    // Label assignment via cluster indices (connectivity path still uses indices)
+    std::vector<int> cluster_labels(N);
+    for (int idx : active_indices) {
+        const Cluster& cluster = clusters[idx];
+        for (int index : cluster.indices) {
+            cluster_labels[index] = cluster.id;
         }
-        return cluster_labels;
-    } else {
-        std::vector<std::vector<std::pair<int, double>>> merging_arrays(NO_PROCESSORS, std::vector<std::pair<int, double>>(clusters.size()));
-        std::vector<int> sort_neighbor_arr(clusters.size(), -1);
-        std::vector<std::vector<int>> update_neighbors_arrays(NO_PROCESSORS, std::vector<int>(clusters.size()));
-        std::vector<int> nn_count(clusters.size(), 0);
-
-        calculate_initial_dissimilarities(base_arr, clusters, *connectivity, max_merge_distance, BATCHSIZE, distance_metric);
-        auto end = std::chrono::high_resolution_clock::now();
-        std::cout << "Initial Dissimilarities: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
-
-        // Free base_arr — no longer needed after initial dissimilarities are computed.
-        base_arr.resize(0, 0);
-
-        RAC_i(clusters, active_indices, max_merge_distance, NO_PROCESSORS, merging_arrays, sort_neighbor_arr, update_neighbors_arrays, nn_count);
-
-        // Label assignment via cluster indices (connectivity path still uses indices)
-        std::vector<int> cluster_labels(N);
-        for (int idx : active_indices) {
-            const Cluster& cluster = clusters[idx];
-            for (int index : cluster.indices) {
-                cluster_labels[index] = cluster.id;
-            }
-        }
-        return cluster_labels;
     }
+    return cluster_labels;
 }
 
 // Public C++ API: accepts N×D input (rows=points, cols=dimensions).
@@ -1465,37 +1486,61 @@ py::array RAC_py(
         throw py::value_error("base_arr dtype must be float32 or float64.");
     }
 
-    // One allocation: DxN working copy (normalized if cosine).
-    Eigen::MatrixXd base_arr;
-
-    if (is_float64) {
-        // Zero-copy transpose: C-contiguous (N,D) numpy == column-major (D,N) Eigen.
-        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
-            static_cast<const double*>(buf.ptr), D, N);
-
-        if (distance_metric == "cosine") {
-            base_arr = base_transposed.colwise().normalized();
-        } else {
-            base_arr = base_transposed;
-        }
-    } else {
-        // Float32 input path: cast to double working matrix once.
-        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
-            static_cast<const float*>(buf.ptr), D, N);
-
-        if (distance_metric == "cosine") {
-            base_arr = base_transposed.cast<double>().colwise().normalized();
-        } else {
-            base_arr = base_transposed.cast<double>();
-        }
-    }
-
     std::shared_ptr<Eigen::SparseMatrix<bool>> sparse_connectivity = nullptr;
     if (!connectivity.is_none()) {
         sparse_connectivity = std::make_shared<Eigen::SparseMatrix<bool>>(connectivity.cast<Eigen::SparseMatrix<bool>>());
         if (sparse_connectivity->rows() != N || sparse_connectivity->cols() != N) {
             throw py::value_error("connectivity must have shape (N, N) matching base_arr rows.");
         }
+    }
+
+    if (is_float64) {
+        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
+            static_cast<const double*>(buf.ptr), D, N);
+
+        Eigen::MatrixXd base_arr;
+        if (distance_metric == "cosine") {
+            base_arr = base_transposed.colwise().normalized();
+        } else {
+            base_arr = base_transposed;
+        }
+
+        std::vector<int> cluster_labels = RAC_impl(
+            base_arr,
+            max_merge_distance,
+            sparse_connectivity.get(),
+            batch_size,
+            no_processors,
+            distance_metric);
+        return py::cast(cluster_labels);
+    }
+
+    // Float32 input: keep full no-connectivity flow in float32.
+    Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
+        static_cast<const float*>(buf.ptr), D, N);
+
+    if (connectivity.is_none()) {
+        Eigen::MatrixXf base_arr;
+        if (distance_metric == "cosine") {
+            base_arr = base_transposed.colwise().normalized();
+        } else {
+            base_arr = base_transposed;
+        }
+
+        std::vector<int> cluster_labels = RAC_impl_no_connectivity(
+            base_arr,
+            max_merge_distance,
+            no_processors,
+            distance_metric);
+        return py::cast(cluster_labels);
+    }
+
+    // Connectivity flow is currently double-precision; keep float32 support via single cast.
+    Eigen::MatrixXd base_arr;
+    if (distance_metric == "cosine") {
+        base_arr = base_transposed.cast<double>().colwise().normalized();
+    } else {
+        base_arr = base_transposed.cast<double>();
     }
 
     std::vector<int> cluster_labels = RAC_impl(
@@ -1505,7 +1550,6 @@ py::array RAC_py(
         batch_size,
         no_processors,
         distance_metric);
-
     return py::cast(cluster_labels);
 }
 

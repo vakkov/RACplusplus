@@ -62,6 +62,7 @@ using SymDistScalar = float;
 #else
 using SymDistScalar = double;
 #endif
+using SymDistVector = Eigen::Matrix<SymDistScalar, Eigen::Dynamic, 1>;
 
 class SymDistMatrix {
 public:
@@ -96,23 +97,25 @@ public:
         return col;
     }
 
-    // Fill an existing VectorXd (must already be size N) — no heap allocation.
-    void get_col_into(int col_id, Eigen::VectorXd& col) const {
+    // Fill an existing vector (must already be size N) — no heap allocation.
+    template <typename Scalar>
+    void get_col_into(int col_id, Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& col) const {
         // k < col_id: scattered access with decreasing stride
         for (int k = 0; k < col_id; ++k) {
-            col[k] = static_cast<double>(data[tri_idx(k, col_id)]);
+            col[k] = static_cast<Scalar>(data[tri_idx(k, col_id)]);
         }
-        col[col_id] = std::numeric_limits<double>::infinity();
+        col[col_id] = std::numeric_limits<Scalar>::infinity();
         // k > col_id: contiguous access starting at tri_idx(col_id, col_id+1)
         if (col_id + 1 < N) {
             size_t base = tri_idx(col_id, col_id + 1);
             for (int k = col_id + 1; k < N; ++k) {
-                col[k] = static_cast<double>(data[base + (k - col_id - 1)]);
+                col[k] = static_cast<Scalar>(data[base + (k - col_id - 1)]);
             }
         }
     }
 
-    void set_col(int col_id, const Eigen::VectorXd& col) {
+    template <typename Scalar>
+    void set_col(int col_id, const Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& col) {
         // k < col_id: scattered access
         for (int k = 0; k < col_id; ++k) {
             data[tri_idx(k, col_id)] = static_cast<SymDistScalar>(col[k]);
@@ -218,7 +221,8 @@ void update_cluster_dissimilarities(
     SymDistMatrix& dist,
     const int NO_PROCESSORS,
     std::vector<int>& dsu_parent,
-    std::vector<int>& dsu_size);
+    std::vector<int>& dsu_size,
+    std::vector<SymDistVector>& merged_columns_workspace);
 
 SymDistMatrix calculate_initial_dissimilarities(
     Eigen::MatrixXd& base_arr,
