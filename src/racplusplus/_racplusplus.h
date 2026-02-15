@@ -187,7 +187,11 @@ Eigen::MatrixXd generateRandomMatrix(int rows, int cols, int seed);
 double get_arr_value(Eigen::MatrixXd& arr, int i, int j);
 void set_arr_value(Eigen::MatrixXd& arr, int i, int j, double value);
 
-void remove_secondary_clusters(std::vector<std::pair<int, int> >& merges, std::vector<Cluster>& clusters, std::vector<int>& active_indices);
+void remove_secondary_clusters(
+    std::vector<std::pair<int, int> >& merges,
+    std::vector<Cluster>& clusters,
+    std::vector<int>& active_indices,
+    std::vector<int>& active_pos);
 //--------------------End Helpers------------------------------------
 
 

@@ -210,14 +210,34 @@ void set_arr_value(Eigen::MatrixXd& arr, int i, int j, double value) {
     arr(i, j) = value;
 }
 
-void remove_secondary_clusters(std::vector<std::pair<int, int> >& merges, std::vector<Cluster>& clusters, std::vector<int>& active_indices) {
+void remove_secondary_clusters(
+    std::vector<std::pair<int, int> >& merges,
+    std::vector<Cluster>& clusters,
+    std::vector<int>& active_indices,
+    std::vector<int>& active_pos) {
     for (const auto& merge : merges) {
-        clusters[merge.second].active = false;
+        const int secondary = merge.second;
+        if (!clusters[secondary].active) {
+            continue;
+        }
+
+        clusters[secondary].active = false;
+
+        const int pos = active_pos[secondary];
+        if (pos < 0) {
+            continue;
+        }
+
+        const int last_idx = static_cast<int>(active_indices.size()) - 1;
+        const int moved_id = active_indices[last_idx];
+        if (pos != last_idx) {
+            active_indices[pos] = moved_id;
+            active_pos[moved_id] = pos;
+        }
+
+        active_indices.pop_back();
+        active_pos[secondary] = -1;
     }
-    active_indices.erase(
-        std::remove_if(active_indices.begin(), active_indices.end(),
-            [&clusters](int id) { return !clusters[id].active; }),
-        active_indices.end());
 }
 //--------------------End Helpers------------------------------------
 
@@ -1016,9 +1036,6 @@ void update_cluster_neighbors(
     std::vector<int>& update_neighbors) {
     Cluster& other_cluster = clusters[update_chunk.first];
 
-    int no_updates = update_chunk.second.size();
-    int no_neighbors = other_cluster.neighbor_distances.size();
-
     std::vector<std::pair<int, double>> new_neighbors;
     std::vector<int> all_looped_neighbors;
     for (size_t i=0; i<update_chunk.second.size(); i++) {
@@ -1174,6 +1191,7 @@ void update_cluster_nn_dist(
     }
 
     if (needs_rescan.empty()) return;
+    std::sort(needs_rescan.begin(), needs_rescan.end());
 
     auto rescan_range = [&](size_t start, size_t end) {
         for (size_t i = start; i < end; i++) {
@@ -1229,6 +1247,7 @@ void paralell_update_cluster_nn(
 
     // Get unique nn indices
     std::vector<int> unique_nn = get_unique_nn(clusters, active_indices, nn_count);
+    std::sort(unique_nn.begin(), unique_nn.end());
     const size_t total = unique_nn.size();
     if (total == 0) {
         return;
@@ -1284,6 +1303,7 @@ std::vector<std::pair<int, int> > find_reciprocal_nn(std::vector<Cluster>& clust
         }
     }
 
+    std::sort(reciprocal_nn.begin(), reciprocal_nn.end());
     return reciprocal_nn;
 }
 
@@ -1301,13 +1321,18 @@ void RAC_i(
     std::vector<int>& nn_count
     ) {
 
+    std::vector<int> active_pos(clusters.size(), -1);
+    for (size_t i = 0; i < active_indices.size(); i++) {
+        active_pos[active_indices[i]] = static_cast<int>(i);
+    }
+
     std::vector<std::pair<int, int>> merges = find_reciprocal_nn(clusters, active_indices);
     while (merges.size() != 0) {
         update_cluster_dissimilarities(merges, clusters, NO_PROCESSORS, merging_arrays, sort_neighbor_arr, update_neighbors_arrays);
 
         paralell_update_cluster_nn(clusters, active_indices, max_merge_distance, NO_PROCESSORS, nn_count);
 
-        remove_secondary_clusters(merges, clusters, active_indices);
+        remove_secondary_clusters(merges, clusters, active_indices, active_pos);
 
         merges = find_reciprocal_nn(clusters, active_indices);
     }
@@ -1320,11 +1345,16 @@ void RAC_i(
     Eigen::MatrixXd& base_arr,
     const int NO_PROCESSORS) {
 
+    std::vector<int> active_pos(clusters.size(), -1);
+    for (size_t i = 0; i < active_indices.size(); i++) {
+        active_pos[active_indices[i]] = static_cast<int>(i);
+    }
+
     std::vector<std::pair<int, int>> merges = find_reciprocal_nn(clusters, active_indices);
     while (merges.size() != 0) {
         update_cluster_dissimilarities(merges, clusters, NO_PROCESSORS, base_arr);
 
-        remove_secondary_clusters(merges, clusters, active_indices);
+        remove_secondary_clusters(merges, clusters, active_indices, active_pos);
 
         merges = find_reciprocal_nn(clusters, active_indices);
     }
@@ -1343,6 +1373,10 @@ void RAC_i(
     long total_dissim = 0, total_nn = 0, total_remove = 0, total_find = 0;
     int iteration = 0;
     std::vector<SymDistVector> merged_columns_workspace;
+    std::vector<int> active_pos(clusters.size(), -1);
+    for (size_t i = 0; i < active_indices.size(); i++) {
+        active_pos[active_indices[i]] = static_cast<int>(i);
+    }
 
     std::vector<std::pair<int, int>> merges = find_reciprocal_nn(clusters, active_indices);
     while (merges.size() != 0) {
@@ -1353,7 +1387,7 @@ void RAC_i(
         update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance, merges, NO_PROCESSORS);
         auto t2 = std::chrono::high_resolution_clock::now();
 
-        remove_secondary_clusters(merges, clusters, active_indices);
+        remove_secondary_clusters(merges, clusters, active_indices, active_pos);
         auto t3 = std::chrono::high_resolution_clock::now();
 
         merges = find_reciprocal_nn(clusters, active_indices);
