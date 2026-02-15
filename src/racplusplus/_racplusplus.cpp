@@ -23,6 +23,7 @@ namespace py = pybind11;
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <type_traits>
 // #define EIGEN_DONT_PARALLELIZE
 #include "Eigen/Dense"
 #include "Eigen/Sparse"
@@ -778,7 +779,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
             tile.noalias() = Bi.transpose() * Bj;
 
             if (is_cosine) {
-                tile = (Scalar(1) - tile.array()).matrix();
+                tile.array() = Scalar(1) - tile.array();
             } else {
                 tile *= Scalar(-2);
                 for (int r = 0; r < tile_i; r++)
@@ -795,10 +796,17 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                     const int i_global = tp.i_start + r;
                     const int c_start = r + 1;
                     if (c_start >= tile_j) continue;
-                    const size_t base_idx = dist.tri_idx(i_global, i_global + 1);
-                    for (int c = c_start; c < tile_j; c++) {
-                        dist.data[base_idx + (c - c_start)] =
-                            static_cast<SymDistScalar>(tile(r, c));
+                    const size_t base_idx =
+                        dist.row_start[static_cast<size_t>(i_global)];
+                    if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
+                        for (int c = c_start; c < tile_j; c++) {
+                            dist.data[base_idx + (c - c_start)] = tile(r, c);
+                        }
+                    } else {
+                        for (int c = c_start; c < tile_j; c++) {
+                            dist.data[base_idx + (c - c_start)] =
+                                static_cast<SymDistScalar>(tile(r, c));
+                        }
                     }
                 }
             } else {
@@ -806,10 +814,18 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                 // Writes are contiguous per row in triangular storage.
                 for (int r = 0; r < tile_i; r++) {
                     const int i_global = tp.i_start + r;
-                    const size_t base_idx = dist.tri_idx(i_global, tp.j_start);
-                    for (int c = 0; c < tile_j; c++) {
-                        dist.data[base_idx + c] =
-                            static_cast<SymDistScalar>(tile(r, c));
+                    const size_t base_idx =
+                        dist.row_start[static_cast<size_t>(i_global)] +
+                        static_cast<size_t>(tp.j_start - i_global - 1);
+                    if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
+                        for (int c = 0; c < tile_j; c++) {
+                            dist.data[base_idx + c] = tile(r, c);
+                        }
+                    } else {
+                        for (int c = 0; c < tile_j; c++) {
+                            dist.data[base_idx + c] =
+                                static_cast<SymDistScalar>(tile(r, c));
+                        }
                     }
                 }
             }

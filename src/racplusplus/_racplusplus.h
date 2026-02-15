@@ -68,15 +68,23 @@ class SymDistMatrix {
 public:
     int N;
     std::vector<SymDistScalar> data;
+    std::vector<size_t> row_start;
 
     explicit SymDistMatrix(int n)
-        : N(n), data(static_cast<size_t>(n) * (n - 1) / 2,
-               std::numeric_limits<SymDistScalar>::infinity()) {}
+        : N(n),
+          data(static_cast<size_t>(n) * (n - 1) / 2,
+               std::numeric_limits<SymDistScalar>::infinity()),
+          row_start(static_cast<size_t>(n), 0) {
+        for (int i = 0; i < N; i++) {
+            row_start[static_cast<size_t>(i)] =
+                static_cast<size_t>(i) * static_cast<size_t>(N)
+                - static_cast<size_t>(i) * static_cast<size_t>(i + 1) / 2;
+        }
+    }
 
     inline size_t tri_idx(int i, int j) const {
-        return static_cast<size_t>(i) * N
-             - static_cast<size_t>(i) * (i + 1) / 2
-             + j - i - 1;
+        return row_start[static_cast<size_t>(i)]
+             + static_cast<size_t>(j - i - 1);
     }
 
     inline double get(int i, int j) const {
@@ -102,12 +110,15 @@ public:
     void get_col_into(int col_id, Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& col) const {
         // k < col_id: scattered access with decreasing stride
         for (int k = 0; k < col_id; ++k) {
-            col[k] = static_cast<Scalar>(data[tri_idx(k, col_id)]);
+            const size_t idx =
+                row_start[static_cast<size_t>(k)] +
+                static_cast<size_t>(col_id - k - 1);
+            col[k] = static_cast<Scalar>(data[idx]);
         }
         col[col_id] = std::numeric_limits<Scalar>::infinity();
         // k > col_id: contiguous access starting at tri_idx(col_id, col_id+1)
         if (col_id + 1 < N) {
-            size_t base = tri_idx(col_id, col_id + 1);
+            size_t base = row_start[static_cast<size_t>(col_id)];
             for (int k = col_id + 1; k < N; ++k) {
                 col[k] = static_cast<Scalar>(data[base + (k - col_id - 1)]);
             }
@@ -118,11 +129,14 @@ public:
     void set_col(int col_id, const Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& col) {
         // k < col_id: scattered access
         for (int k = 0; k < col_id; ++k) {
-            data[tri_idx(k, col_id)] = static_cast<SymDistScalar>(col[k]);
+            const size_t idx =
+                row_start[static_cast<size_t>(k)] +
+                static_cast<size_t>(col_id - k - 1);
+            data[idx] = static_cast<SymDistScalar>(col[k]);
         }
         // k > col_id: contiguous access
         if (col_id + 1 < N) {
-            size_t base = tri_idx(col_id, col_id + 1);
+            size_t base = row_start[static_cast<size_t>(col_id)];
             for (int k = col_id + 1; k < N; ++k) {
                 data[base + (k - col_id - 1)] = static_cast<SymDistScalar>(col[k]);
             }
@@ -138,7 +152,10 @@ public:
 
         // k < col_id: scattered access
         for (int k = 0; k < col_id; ++k) {
-            double v = static_cast<double>(data[tri_idx(k, col_id)]);
+            const size_t idx =
+                row_start[static_cast<size_t>(k)] +
+                static_cast<size_t>(col_id - k - 1);
+            double v = static_cast<double>(data[idx]);
             if (v < best_val) {
                 best_val = v;
                 best_idx = k;
@@ -147,7 +164,7 @@ public:
 
         // k > col_id: contiguous access
         if (col_id + 1 < N) {
-            size_t base = tri_idx(col_id, col_id + 1);
+            size_t base = row_start[static_cast<size_t>(col_id)];
             for (int k = col_id + 1; k < N; ++k) {
                 double v = static_cast<double>(data[base + (k - col_id - 1)]);
                 if (v < best_val) {
@@ -164,11 +181,14 @@ public:
         const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
         // k < cluster_id: scattered access
         for (int k = 0; k < cluster_id; ++k) {
-            data[tri_idx(k, cluster_id)] = inf;
+            const size_t idx =
+                row_start[static_cast<size_t>(k)] +
+                static_cast<size_t>(cluster_id - k - 1);
+            data[idx] = inf;
         }
         // k > cluster_id: contiguous access
         if (cluster_id + 1 < N) {
-            size_t base = tri_idx(cluster_id, cluster_id + 1);
+            size_t base = row_start[static_cast<size_t>(cluster_id)];
             size_t count = static_cast<size_t>(N - cluster_id - 1);
             std::fill_n(data.data() + base, count, inf);
         }
