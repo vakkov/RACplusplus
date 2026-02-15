@@ -372,6 +372,7 @@ void update_cluster_dissimilarities(
     const size_t merge_count = merges.size();
     const int N = dist.N;
     const size_t MERGE_BATCH = 1024;
+    const size_t requested_threads = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
 
     // Reusable column buffers (persist across RAC iterations for this RAC invocation).
     auto& merged_columns = merged_columns_workspace;
@@ -414,33 +415,52 @@ void update_cluster_dissimilarities(
             batch_size * batch_size,
             std::numeric_limits<SymDistScalar>::infinity());
 
-        for (size_t i = 0; i < batch_size; i++) {
-            const int mi = merge_main_ids[i];
-            const int si = merge_secondary_ids[i];
-            const double sz_mi = merge_main_sizes[i];
-            const double sz_si = merge_secondary_sizes[i];
-            const double inv_i = merge_inv_sizes[i];
+        auto precompute_cross_range = [&](size_t start, size_t end) {
+            for (size_t i = start; i < end; i++) {
+                const int mi = merge_main_ids[i];
+                const int si = merge_secondary_ids[i];
+                const double sz_mi = merge_main_sizes[i];
+                const double sz_si = merge_secondary_sizes[i];
+                const double inv_i = merge_inv_sizes[i];
 
-            for (size_t j = i + 1; j < batch_size; j++) {
-                const int mj = merge_main_ids[j];
-                const int sj = merge_secondary_ids[j];
-                const double sz_mj = merge_main_sizes[j];
-                const double sz_sj = merge_secondary_sizes[j];
-                const double inv_j = merge_inv_sizes[j];
+                for (size_t j = i + 1; j < batch_size; j++) {
+                    const int mj = merge_main_ids[j];
+                    const int sj = merge_secondary_ids[j];
+                    const double sz_mj = merge_main_sizes[j];
+                    const double sz_sj = merge_secondary_sizes[j];
+                    const double inv_j = merge_inv_sizes[j];
 
-                const double d_mi_mj = dist.get(mi, mj);
-                const double d_mi_sj = dist.get(mi, sj);
-                const double d_si_mj = dist.get(si, mj);
-                const double d_si_sj = dist.get(si, sj);
+                    const double d_mi_mj = dist.get(mi, mj);
+                    const double d_mi_sj = dist.get(mi, sj);
+                    const double d_si_mj = dist.get(si, mj);
+                    const double d_si_sj = dist.get(si, sj);
 
-                const double d_mi_to_j = (sz_mj * d_mi_mj + sz_sj * d_mi_sj) * inv_j;
-                const double d_si_to_j = (sz_mj * d_si_mj + sz_sj * d_si_sj) * inv_j;
-                const double d_ij = (sz_mi * d_mi_to_j + sz_si * d_si_to_j) * inv_i;
+                    const double d_mi_to_j = (sz_mj * d_mi_mj + sz_sj * d_mi_sj) * inv_j;
+                    const double d_si_to_j = (sz_mj * d_si_mj + sz_sj * d_si_sj) * inv_j;
+                    const double d_ij = (sz_mi * d_mi_to_j + sz_si * d_si_to_j) * inv_i;
 
-                const SymDistScalar val = static_cast<SymDistScalar>(d_ij);
-                cross_dist[i * batch_size + j] = val;
-                cross_dist[j * batch_size + i] = val;
+                    const SymDistScalar val = static_cast<SymDistScalar>(d_ij);
+                    cross_dist[i * batch_size + j] = val;
+                    cross_dist[j * batch_size + i] = val;
+                }
             }
+        };
+
+        const size_t cross_threads = std::min(requested_threads, batch_size);
+        if (cross_threads <= 1 || batch_size < 128) {
+            precompute_cross_range(0, batch_size);
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(cross_threads);
+            const size_t chunk_size = batch_size / cross_threads;
+            const size_t remainder = batch_size % cross_threads;
+            size_t start = 0;
+            for (size_t t = 0; t < cross_threads; t++) {
+                const size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+                threads.emplace_back(precompute_cross_range, start, end);
+                start = end;
+            }
+            for (auto& thread : threads) thread.join();
         }
 
         // Parallel compute for this batch.
@@ -475,7 +495,6 @@ void update_cluster_dissimilarities(
             }
         };
 
-        size_t requested_threads = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
         size_t no_threads = std::min(requested_threads, batch_size);
 
         if (no_threads <= 1) {
@@ -491,7 +510,7 @@ void update_cluster_dissimilarities(
                 threads.emplace_back(compute_range, start, end);
                 start = end;
             }
-            for (auto& th : threads) th.join();
+            for (auto& thread : threads) thread.join();
         }
 
         // Serial write-back: update dist columns first, then fill infinity for secondaries.
@@ -612,46 +631,78 @@ void calculate_initial_dissimilarities(
         sq_norms = base_arr.colwise().squaredNorm();
     }
 
-    for (int batchStart = 0; batchStart < clustersSize; batchStart += batch_size) {
-        int batchEnd = std::min(batchStart + batch_size, clustersSize);
+    const size_t requested_threads =
+        std::max<size_t>(1, static_cast<size_t>(Eigen::nbThreads()));
 
-        for (int i = batchStart; i < batchEnd; ++i) {
-            Cluster& cluster = clusters[i];
-            auto base_col = base_arr.col(i);
+    auto process_cluster = [&](int i) {
+        Cluster& cluster = clusters[i];
+        auto base_col = base_arr.col(i);
 
-            std::vector<std::pair<int, double>> neighbors;
+        std::vector<std::pair<int, double>> neighbors;
 
-            int nearest_neighbor = -1;
-            double min = std::numeric_limits<double>::infinity();
+        int nearest_neighbor = -1;
+        double min = std::numeric_limits<double>::infinity();
 
-            for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
-                int j = it.index();
-                bool value = it.value();
+        for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
+            int j = it.index();
+            bool value = it.value();
 
-                if (j != i && value) {
-                    const double dot = base_col.dot(base_arr.col(j));
-                    double distance = 0.0;
-                    if (is_cosine) {
-                        distance = 1.0 - dot;
-                    } else {
-                        double sq_dist = sq_norms[i] + sq_norms[j] - 2.0 * dot;
-                        if (sq_dist < 0.0) {
-                            sq_dist = 0.0;
-                        }
-                        distance = std::sqrt(sq_dist);
+            if (j != i && value) {
+                const double dot = base_col.dot(base_arr.col(j));
+                double distance = 0.0;
+                if (is_cosine) {
+                    distance = 1.0 - dot;
+                } else {
+                    double sq_dist = sq_norms[i] + sq_norms[j] - 2.0 * dot;
+                    if (sq_dist < 0.0) {
+                        sq_dist = 0.0;
                     }
+                    distance = std::sqrt(sq_dist);
+                }
 
-                    neighbors.push_back(std::make_pair(j, distance));
+                neighbors.push_back(std::make_pair(j, distance));
 
-                    if (distance < min && distance < max_merge_distance) {
-                        min = distance;
-                        nearest_neighbor = j;
-                    }
+                if (distance < min && distance < max_merge_distance) {
+                    min = distance;
+                    nearest_neighbor = j;
                 }
             }
+        }
 
-            cluster.neighbor_distances = std::move(neighbors);
-            cluster.nn = nearest_neighbor;
+        cluster.neighbor_distances = std::move(neighbors);
+        cluster.nn = nearest_neighbor;
+    };
+
+    for (int batchStart = 0; batchStart < clustersSize; batchStart += batch_size) {
+        int batchEnd = std::min(batchStart + batch_size, clustersSize);
+        const int batchCount = batchEnd - batchStart;
+        const size_t no_threads = std::min(requested_threads, static_cast<size_t>(batchCount));
+
+        if (no_threads <= 1 || batchCount < 64) {
+            for (int i = batchStart; i < batchEnd; ++i) {
+                process_cluster(i);
+            }
+            continue;
+        }
+
+        std::vector<std::thread> threads;
+        threads.reserve(no_threads);
+
+        size_t chunk_size = static_cast<size_t>(batchCount) / no_threads;
+        size_t remainder = static_cast<size_t>(batchCount) % no_threads;
+        int start = batchStart;
+        for (size_t t = 0; t < no_threads; t++) {
+            int end = start + static_cast<int>(chunk_size) + (t < remainder ? 1 : 0);
+            threads.emplace_back([&process_cluster, start, end]() {
+                for (int i = start; i < end; ++i) {
+                    process_cluster(i);
+                }
+            });
+            start = end;
+        }
+
+        for (auto& thread : threads) {
+            thread.join();
         }
     }
 }
@@ -1216,7 +1267,7 @@ void update_cluster_nn_dist(
             threads.emplace_back(rescan_range, start, end);
             start = end;
         }
-        for (auto& th : threads) th.join();
+        for (auto& thread : threads) thread.join();
     }
 }
 
