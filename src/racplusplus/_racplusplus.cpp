@@ -584,15 +584,19 @@ void update_cluster_dissimilarities(
         is_iter_secondary[merge.second] = 1;
     }
 
+    // Reuse per-batch metadata buffers across sub-batches.
+    std::vector<int> merge_main_ids(max_batch);
+    std::vector<int> merge_secondary_ids(max_batch);
+    std::vector<double> merge_main_sizes(max_batch);
+    std::vector<double> merge_secondary_sizes(max_batch);
+    std::vector<double> merge_inv_sizes(max_batch);
+    std::vector<SymDistScalar> cross_dist(
+        max_batch * max_batch,
+        std::numeric_limits<SymDistScalar>::infinity());
+
     for (size_t batch_start = 0; batch_start < merge_count; batch_start += MERGE_BATCH) {
         const size_t batch_end = std::min(batch_start + MERGE_BATCH, merge_count);
         const size_t batch_size = batch_end - batch_start;
-
-        std::vector<int> merge_main_ids(batch_size);
-        std::vector<int> merge_secondary_ids(batch_size);
-        std::vector<double> merge_main_sizes(batch_size);
-        std::vector<double> merge_secondary_sizes(batch_size);
-        std::vector<double> merge_inv_sizes(batch_size);
 
         for (size_t i = 0; i < batch_size; i++) {
             const size_t global_i = batch_start + i;
@@ -605,9 +609,9 @@ void update_cluster_dissimilarities(
 
         // Precompute intra-batch merged-to-merged distances once.
         // This avoids repeated random dist.get() calls in the per-column loop.
-        std::vector<SymDistScalar> cross_dist(
-            batch_size * batch_size,
-            std::numeric_limits<SymDistScalar>::infinity());
+        const size_t cross_count = batch_size * batch_size;
+        std::fill_n(cross_dist.data(), cross_count,
+                    std::numeric_limits<SymDistScalar>::infinity());
 
         auto precompute_cross_range = [&](size_t start, size_t end) {
             for (size_t i = start; i < end; i++) {
