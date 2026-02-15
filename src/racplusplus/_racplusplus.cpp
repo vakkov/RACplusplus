@@ -736,72 +736,96 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
     const int D = static_cast<int>(base_arr.rows());
     const int TILE = 4096;
     const bool is_cosine = (distance_metric == "cosine");
+    const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(Eigen::nbThreads()));
 
     SymDistMatrix dist(N);
-
-    // Per-cluster NN tracking.
-    std::vector<double> nn_best(N, std::numeric_limits<double>::infinity());
-    std::vector<int> nn_idx(N, -1);
 
     Eigen::Matrix<Scalar, 1, Eigen::Dynamic> sq_norms;
     if (!is_cosine) {
         sq_norms = base_arr.colwise().squaredNorm();
     }
 
-    // Tiled pairwise distance computation.
-    // Only compute upper-triangle tile pairs (j_start >= i_start).
+    // Build tile pair worklist for parallel dispatch.
+    struct TilePair { int i_start, i_end, j_start, j_end; };
+    std::vector<TilePair> tile_pairs;
+    tile_pairs.reserve(
+        ((N + TILE - 1) / TILE) * ((N + TILE - 1) / TILE + 1) / 2);
     for (int i_start = 0; i_start < N; i_start += TILE) {
         const int i_end = std::min(i_start + TILE, N);
-        const int tile_i = i_end - i_start;
-
-        auto Bi = base_arr.block(0, i_start, D, tile_i);
-
         for (int j_start = i_start; j_start < N; j_start += TILE) {
             const int j_end = std::min(j_start + TILE, N);
-            const int tile_j = j_end - j_start;
+            tile_pairs.push_back({i_start, i_end, j_start, j_end});
+        }
+    }
 
-            auto Bj = base_arr.block(0, j_start, D, tile_j);
-            Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> tile = Bi.transpose() * Bj;
+    // Phase 1: Parallel tile GEMM + storage (no NN tracking).
+    // Each tile pair writes to a disjoint region of dist.data, so no races.
+    // Single-threaded GEMM per tile avoids Eigen thread sync overhead.
+    const int saved_threads = Eigen::nbThreads();
+    Eigen::setNbThreads(1);
+
+    run_parallel_for(n_threads, tile_pairs.size(), [&](size_t start, size_t end) {
+        Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> tile;
+
+        for (size_t t = start; t < end; t++) {
+            const auto& tp = tile_pairs[t];
+            const int tile_i = tp.i_end - tp.i_start;
+            const int tile_j = tp.j_end - tp.j_start;
+
+            auto Bi = base_arr.block(0, tp.i_start, D, tile_i);
+            auto Bj = base_arr.block(0, tp.j_start, D, tile_j);
+
+            tile.noalias() = Bi.transpose() * Bj;
 
             if (is_cosine) {
                 tile = (Scalar(1) - tile.array()).matrix();
             } else {
                 tile *= Scalar(-2);
-                for (int r = 0; r < tile_i; r++) {
-                    tile.row(r).array() += sq_norms[i_start + r];
-                }
-                for (int c = 0; c < tile_j; c++) {
-                    tile.col(c).array() += sq_norms[j_start + c];
-                }
+                for (int r = 0; r < tile_i; r++)
+                    tile.row(r).array() += sq_norms[tp.i_start + r];
+                for (int c = 0; c < tile_j; c++)
+                    tile.col(c).array() += sq_norms[tp.j_start + c];
                 tile = tile.array().max(Scalar(0)).sqrt().matrix();
             }
 
-            for (int r = 0; r < tile_i; r++) {
-                const int i_global = i_start + r;
-                for (int c = 0; c < tile_j; c++) {
-                    const int j_global = j_start + c;
-                    if (i_global >= j_global) continue;
-
-                    const Scalar raw_val = tile(r, c);
-                    const double val = static_cast<double>(raw_val);
-                    dist.data[dist.tri_idx(i_global, j_global)] = static_cast<SymDistScalar>(raw_val);
-
-                    if (val < nn_best[i_global]) {
-                        nn_best[i_global] = val;
-                        nn_idx[i_global] = j_global;
+            // Store to triangular matrix — branchless, no NN tracking.
+            if (tp.i_start == tp.j_start) {
+                // Diagonal tile: upper triangle only.
+                for (int r = 0; r < tile_i; r++) {
+                    const int i_global = tp.i_start + r;
+                    const int c_start = r + 1;
+                    if (c_start >= tile_j) continue;
+                    const size_t base_idx = dist.tri_idx(i_global, i_global + 1);
+                    for (int c = c_start; c < tile_j; c++) {
+                        dist.data[base_idx + (c - c_start)] =
+                            static_cast<SymDistScalar>(tile(r, c));
                     }
-                    if (val < nn_best[j_global]) {
-                        nn_best[j_global] = val;
-                        nn_idx[j_global] = i_global;
+                }
+            } else {
+                // Off-diagonal tile: all (i,j) satisfy i < j.
+                // Writes are contiguous per row in triangular storage.
+                for (int r = 0; r < tile_i; r++) {
+                    const int i_global = tp.i_start + r;
+                    const size_t base_idx = dist.tri_idx(i_global, tp.j_start);
+                    for (int c = 0; c < tile_j; c++) {
+                        dist.data[base_idx + c] =
+                            static_cast<SymDistScalar>(tile(r, c));
                     }
                 }
             }
         }
-    }
+    });
 
-    for (int k = 0; k < N; k++) {
-        clusters[k].nn = (nn_best[k] < max_merge_distance) ? nn_idx[k] : -1;
-    }
+    Eigen::setNbThreads(saved_threads);
+
+    // Phase 2: Parallel NN computation from stored distances.
+    // Cost: ~N column scans of ~N entries each
+    run_parallel_for(n_threads, static_cast<size_t>(N), [&](size_t start, size_t end) {
+        for (size_t k = start; k < end; k++) {
+            auto [min_val, min_idx] = dist.min_in_col(static_cast<int>(k));
+            clusters[k].nn = (min_val < max_merge_distance) ? min_idx : -1;
+        }
+    });
 
     return dist;
 }
