@@ -1413,7 +1413,7 @@ std::vector<int> RAC(
 #if !RACPP_BUILDING_LIB_ONLY
 //Wrapper for RAC, convert return vector to a numpy array
 py::array RAC_py(
-    py::array_t<double, py::array::c_style | py::array::forcecast> base_arr_np,
+    py::array_t<double, py::array::c_style> base_arr_np,
     double max_merge_distance,
     py::object connectivity = py::none(),
     int batch_size = 0,
@@ -1421,6 +1421,22 @@ py::array RAC_py(
     std::string distance_metric = "euclidean") {
 
     auto buf = base_arr_np.request();
+    if (buf.ndim != 2) {
+        throw py::value_error("base_arr must be a 2D numpy.ndarray with shape (N, D) and dtype float64.");
+    }
+    if (buf.shape[0] <= 0 || buf.shape[1] <= 0) {
+        throw py::value_error("base_arr must have positive shape (N > 0, D > 0).");
+    }
+    if (batch_size < 0) {
+        throw py::value_error("batch_size must be >= 0.");
+    }
+    if (no_processors < 0) {
+        throw py::value_error("no_processors must be >= 0.");
+    }
+    if (distance_metric != "cosine" && distance_metric != "euclidean") {
+        throw py::value_error("distance_metric must be either 'cosine' or 'euclidean'.");
+    }
+
     const int N = static_cast<int>(buf.shape[0]);
     const int D = static_cast<int>(buf.shape[1]);
 
@@ -1439,6 +1455,9 @@ py::array RAC_py(
     std::shared_ptr<Eigen::SparseMatrix<bool>> sparse_connectivity = nullptr;
     if (!connectivity.is_none()) {
         sparse_connectivity = std::make_shared<Eigen::SparseMatrix<bool>>(connectivity.cast<Eigen::SparseMatrix<bool>>());
+        if (sparse_connectivity->rows() != N || sparse_connectivity->cols() != N) {
+            throw py::value_error("connectivity must have shape (N, N) matching base_arr rows.");
+        }
     }
 
     std::vector<int> cluster_labels = RAC_impl(
@@ -1494,19 +1513,26 @@ PYBIND11_MODULE(_racplusplus, m){
         2023
     )doc";
 
-    m.def("rac", &RAC_py, R"fdoc(
+    m.def("rac", &RAC_py,
+        py::arg("base_arr").noconvert(),
+        py::arg("max_merge_distance"),
+        py::arg("connectivity") = py::none(),
+        py::arg("batch_size") = 0,
+        py::arg("no_processors") = 0,
+        py::arg("distance_metric") = "euclidean",
+        R"fdoc(
         Run RAC algorithm on a provided array of points.
 
         Params:
         [base_arr] -        Actual data points array to be clustered. Each row is a point, with each column
                             representing the points value for a particular feature/dimension.
         [max_merge_distance] - Hyperparameter, maximum distance allowed for two clusters to merge with one another.
-        [batch_size] -      Optional hyperparameter, batch size for calculating initial dissimilarities
-                            with a connectivity matrix.
-                            Default: Defaults to the number of points in base_arr / 10 if 0 passed or no value passed.
         [connectivity] -    Optional: Connectivity matrix indicating whether points can be considered as neighbors.
                             Value of 1 at index i,j indicates point i and j are connected, 0 indicates disconnected.
                             Default: No connectivity matrix, use pairwise cosine to calculate distances.
+        [batch_size] -      Optional hyperparameter, batch size for calculating initial dissimilarities
+                            with a connectivity matrix.
+                            Default: Defaults to the number of points in base_arr / 10 if 0 passed or no value passed.
         [no_processors] -   Hyperparameter, number of processors to use during computation.
                             Defaults to the number of processors found on your machine if 0 passed
                             or no value passed.

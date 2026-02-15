@@ -350,7 +350,7 @@ std::vector<int> RAC(
 
 #if !RACPP_BUILDING_LIB_ONLY
 py::array RAC_py(
-    py::array_t<double, py::array::c_style | py::array::forcecast> base_arr_np,
+    py::array_t<double, py::array::c_style> base_arr_np,
     double max_merge_distance,
     py::object connectivity,
     int batch_size,
