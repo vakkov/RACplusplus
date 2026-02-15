@@ -392,7 +392,8 @@ void update_cluster_dissimilarities(
     std::vector<int>& dsu_parent,
     std::vector<int>& dsu_size,
     std::vector<SymDistVector>& merged_columns_workspace,
-    double max_merge_distance) {
+    double max_merge_distance,
+    const std::vector<char>& is_alive_ws) {
 
     if (merges.empty()) {
         return;
@@ -554,6 +555,8 @@ void update_cluster_dissimilarities(
         // update_cluster_nn_dist instead.
         const bool is_last_batch = (batch_end >= merge_count);
         if (is_last_batch) {
+            const char* alive = is_alive_ws.data();
+            const char* iter_secondary = is_iter_secondary.data();
             for (size_t i = 0; i < batch_size; i++) {
                 const int main_id = merge_main_ids[i];
                 const SymDistScalar* col_data = merged_columns[i].data();
@@ -561,8 +564,8 @@ void update_cluster_dissimilarities(
                 int best_idx = -1;
 
                 for (int k = 0; k < N; k++) {
-                    if (!clusters[k].active) continue;
-                    if (is_iter_secondary[k]) continue;
+                    if (!alive[k]) continue;
+                    if (iter_secondary[k]) continue;
                     if (col_data[k] < best_val) {
                         best_val = col_data[k];
                         best_idx = k;
@@ -1263,6 +1266,7 @@ void update_cluster_nn_dist(
     double max_merge_distance,
     const std::vector<std::pair<int, int>>& merges,
     const int NO_PROCESSORS,
+    const std::vector<char>& is_alive_ws,
     std::vector<char>& is_dead_ws,
     std::vector<char>& is_changed_ws) {
 
@@ -1303,7 +1307,7 @@ void update_cluster_nn_dist(
         // is_changed_ws[old_nn] catches both ==1 and ==2 (any main).
         const int old_nn = clusters[idx].nn;
         if (old_nn != -1 &&
-            (!clusters[old_nn].active || is_dead_ws[old_nn] || is_changed_ws[old_nn])) {
+            (!is_alive_ws[old_nn] || is_dead_ws[old_nn] || is_changed_ws[old_nn])) {
             needs_rescan.push_back(idx);
         }
     }
@@ -1318,6 +1322,8 @@ void update_cluster_nn_dist(
     }
 
     auto rescan_range = [&](size_t start, size_t end) {
+        const char* alive = is_alive_ws.data();
+        const char* dead = is_dead_ws.data();
         for (size_t i = start; i < end; i++) {
             const int cid = clusters[needs_rescan[i]].id;
             double best_val = std::numeric_limits<double>::infinity();
@@ -1325,7 +1331,7 @@ void update_cluster_nn_dist(
 
             // k < cid: scattered upper-triangle entries
             for (int k = 0; k < cid; ++k) {
-                if (!clusters[k].active || is_dead_ws[k]) continue;
+                if (!alive[k] || dead[k]) continue;
                 const double v = static_cast<double>(dist.data[dist.tri_idx(k, cid)]);
                 if (v < best_val) {
                     best_val = v;
@@ -1338,7 +1344,7 @@ void update_cluster_nn_dist(
                 const size_t base = dist.tri_idx(cid, cid + 1);
                 const SymDistScalar* tail = dist.data.data() + base;
                 for (int k = cid + 1; k < N; ++k) {
-                    if (!clusters[k].active || is_dead_ws[k]) continue;
+                    if (!alive[k] || dead[k]) continue;
                     const double v = static_cast<double>(tail[k - cid - 1]);
                     if (v < best_val) {
                         best_val = v;
@@ -1541,6 +1547,10 @@ void RAC_i(
     // Persistent workspaces for update_cluster_nn_dist.
     std::vector<char> is_dead_ws(orig_N, 0);
     std::vector<char> is_changed_ws(orig_N, 0);
+    std::vector<char> is_alive_ws(orig_N, 0);
+    for (int idx : active_indices) {
+        is_alive_ws[idx] = 1;
+    }
 
     // Compaction state.
     bool did_compact = false;
@@ -1552,7 +1562,7 @@ void RAC_i(
         auto t0 = std::chrono::high_resolution_clock::now();
         update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS,
                                        dsu_parent, dsu_size, merged_columns_workspace,
-                                       max_merge_distance);
+                                       max_merge_distance, is_alive_ws);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         // Mirror merges into original DSU for final label assignment.
@@ -1565,10 +1575,13 @@ void RAC_i(
         }
 
         update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance,
-                               merges, NO_PROCESSORS, is_dead_ws, is_changed_ws);
+                               merges, NO_PROCESSORS, is_alive_ws, is_dead_ws, is_changed_ws);
         auto t2 = std::chrono::high_resolution_clock::now();
 
         remove_secondary_clusters(merges, clusters, active_indices, active_pos);
+        for (const auto& merge : merges) {
+            is_alive_ws[merge.second] = 0;
+        }
         auto t3 = std::chrono::high_resolution_clock::now();
 
         // =================================================================
@@ -1659,6 +1672,7 @@ void RAC_i(
 
             // Resize workspaces.
             merged_columns_workspace.clear();
+            is_alive_ws.assign(A, 1);
             is_dead_ws.assign(A, 0);
             is_changed_ws.assign(A, 0);
 

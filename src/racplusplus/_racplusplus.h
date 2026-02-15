@@ -227,7 +227,8 @@ void update_cluster_dissimilarities(
     std::vector<int>& dsu_parent,
     std::vector<int>& dsu_size,
     std::vector<SymDistVector>& merged_columns_workspace,
-    double max_merge_distance);
+    double max_merge_distance,
+    const std::vector<char>& is_alive_ws);
 
 SymDistMatrix calculate_initial_dissimilarities(
     Eigen::MatrixXd& base_arr,
@@ -318,7 +319,10 @@ void update_cluster_nn_dist(
     const SymDistMatrix& dist,
     double max_merge_distance,
     const std::vector<std::pair<int, int>>& merges,
-    const int NO_PROCESSORS);
+    const int NO_PROCESSORS,
+    const std::vector<char>& is_alive_ws,
+    std::vector<char>& is_dead_ws,
+    std::vector<char>& is_changed_ws);
 
 std::vector<std::pair<int, int> > find_reciprocal_nn(std::vector<Cluster>& clusters, const std::vector<int>& active_indices);
 //-----------------------End Updating Nearest Neighbors-----------------------------------
