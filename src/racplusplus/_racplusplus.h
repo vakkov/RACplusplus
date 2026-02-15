@@ -312,6 +312,7 @@ void update_cluster_nn_dist(
     const std::vector<int>& active_indices,
     const SymDistMatrix& dist,
     double max_merge_distance,
+    const std::vector<std::pair<int, int>>& merges,
     const int NO_PROCESSORS);
 
 std::vector<std::pair<int, int> > find_reciprocal_nn(std::vector<Cluster>& clusters, const std::vector<int>& active_indices);

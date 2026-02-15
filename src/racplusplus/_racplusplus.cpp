@@ -1108,49 +1108,66 @@ void update_cluster_nn_dist(
     const std::vector<int>& active_indices,
     const SymDistMatrix& dist,
     double max_merge_distance,
+    const std::vector<std::pair<int, int>>& merges,
     const int NO_PROCESSORS) {
 
-    // Collect indices that actually need updating.
-    std::vector<int> needs_update;
-    needs_update.reserve(active_indices.size());
+    if (merges.empty()) return;
+
+    const int N = dist.N;
+
+    // O(1) lookup: secondary (dead) or main (distance column rewritten).
+    std::vector<char> is_dead(N, 0);
+    std::vector<char> is_changed(N, 0);
+    for (const auto& m : merges) {
+        is_changed[m.first] = 1;
+        is_dead[m.second] = 1;
+    }
+
+    // Only rescan clusters whose NN was invalidated.
+    // Skip secondaries (about to be removed; min_in_col returns inf anyway).
+    // Skip clusters whose NN is alive and unchanged — their NN is still valid.
+    std::vector<int> needs_rescan;
+    needs_rescan.reserve(active_indices.size());
     for (int idx : active_indices) {
-        Cluster& cluster = clusters[idx];
-        if (cluster.will_merge || (cluster.nn != -1 && clusters[cluster.nn].active && clusters[cluster.nn].will_merge)) {
-            needs_update.push_back(idx);
+        const int cid = clusters[idx].id;
+        if (is_dead[cid]) continue;
+
+        const int old_nn = clusters[idx].nn;
+        const bool nn_invalidated =
+            is_changed[cid] ||
+            (old_nn != -1 && (is_dead[old_nn] || is_changed[old_nn]));
+
+        if (nn_invalidated) {
+            needs_rescan.push_back(idx);
         }
     }
 
-    if (needs_update.empty()) return;
+    if (needs_rescan.empty()) return;
 
-    auto update_range = [&](size_t start, size_t end) {
+    auto rescan_range = [&](size_t start, size_t end) {
         for (size_t i = start; i < end; i++) {
-            clusters[needs_update[i]].update_nn(dist, max_merge_distance);
+            clusters[needs_rescan[i]].update_nn(dist, max_merge_distance);
         }
     };
 
-    size_t count = needs_update.size();
-    size_t requested = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
-    size_t no_threads = std::min(requested, count);
+    const size_t count = needs_rescan.size();
+    const size_t requested = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
+    const size_t no_threads = std::min(requested, count);
 
     if (no_threads <= 1) {
-        update_range(0, count);
+        rescan_range(0, count);
     } else {
         std::vector<std::thread> threads;
         threads.reserve(no_threads);
-
         size_t chunk = count / no_threads;
         size_t remainder = count % no_threads;
         size_t start = 0;
-
         for (size_t t = 0; t < no_threads; t++) {
             size_t end = start + chunk + (t < remainder ? 1 : 0);
-            threads.emplace_back(update_range, start, end);
+            threads.emplace_back(rescan_range, start, end);
             start = end;
         }
-
-        for (auto& th : threads) {
-            th.join();
-        }
+        for (auto& th : threads) th.join();
     }
 }
 
@@ -1301,7 +1318,7 @@ void RAC_i(
         update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS, dsu_parent, dsu_size, merged_columns_workspace);
         auto t1 = std::chrono::high_resolution_clock::now();
 
-        update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance, NO_PROCESSORS);
+        update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance, merges, NO_PROCESSORS);
         auto t2 = std::chrono::high_resolution_clock::now();
 
         remove_secondary_clusters(merges, clusters, active_indices);
