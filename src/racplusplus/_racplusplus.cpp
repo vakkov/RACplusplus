@@ -19,6 +19,10 @@ namespace py = pybind11;
 #include <iostream>
 #include <thread>
 #include <algorithm>
+#include <memory>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
 // #define EIGEN_DONT_PARALLELIZE
 #include "Eigen/Dense"
 #include "Eigen/Sparse"
@@ -57,6 +61,160 @@ std::string vectorToString(const std::vector<std::pair<int, int>>& merges) {
     }
     oss << "]";
     return oss.str();
+}
+
+class TinyThreadPool {
+public:
+    explicit TinyThreadPool(size_t thread_count)
+        : thread_count_(std::max<size_t>(1, thread_count)) {
+        if (thread_count_ <= 1) {
+            return;
+        }
+        workers_.reserve(thread_count_ - 1);
+        for (size_t worker_id = 1; worker_id < thread_count_; ++worker_id) {
+            workers_.emplace_back([this, worker_id]() { worker_loop(worker_id); });
+        }
+    }
+
+    ~TinyThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            ++generation_;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            worker.join();
+        }
+    }
+
+    template <typename Fn>
+    void parallel_for(size_t total, Fn&& fn) {
+        if (total == 0) {
+            return;
+        }
+        if (thread_count_ <= 1 || total == 1) {
+            fn(0, total);
+            return;
+        }
+
+        const size_t active_threads = std::min(thread_count_, total);
+        if (active_threads <= 1) {
+            fn(0, total);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_threads_ = active_threads;
+            total_work_ = total;
+            remaining_workers_ = active_threads_ - 1;
+            job_fn_ = [&fn](size_t start, size_t end) { fn(start, end); };
+            ++generation_;
+        }
+        cv_.notify_all();
+
+        auto [main_start, main_end] = chunk_for_worker(0, total, active_threads);
+        if (main_start < main_end) {
+            job_fn_(main_start, main_end);
+        }
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_cv_.wait(lock, [this]() { return remaining_workers_ == 0; });
+    }
+
+private:
+    using JobFn = std::function<void(size_t, size_t)>;
+
+    static std::pair<size_t, size_t> chunk_for_worker(
+        size_t worker_id,
+        size_t total,
+        size_t active_threads) {
+        const size_t chunk = total / active_threads;
+        const size_t remainder = total % active_threads;
+        const size_t start = worker_id * chunk + std::min(worker_id, remainder);
+        const size_t end = start + chunk + (worker_id < remainder ? 1 : 0);
+        return {start, end};
+    }
+
+    void worker_loop(size_t worker_id) {
+        size_t seen_generation = 0;
+        while (true) {
+            JobFn fn;
+            size_t total = 0;
+            size_t active = 0;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this, seen_generation]() {
+                    return stopping_ || generation_ != seen_generation;
+                });
+
+                if (stopping_) {
+                    return;
+                }
+
+                seen_generation = generation_;
+                total = total_work_;
+                active = active_threads_;
+                if (worker_id >= active) {
+                    continue;
+                }
+                fn = job_fn_;
+            }
+
+            auto [start, end] = chunk_for_worker(worker_id, total, active);
+            if (start < end) {
+                fn(start, end);
+            }
+
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (remaining_workers_ > 0) {
+                --remaining_workers_;
+                if (remaining_workers_ == 0) {
+                    done_cv_.notify_one();
+                }
+            }
+        }
+    }
+
+    size_t thread_count_;
+    std::vector<std::thread> workers_;
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::condition_variable done_cv_;
+
+    bool stopping_ = false;
+    size_t generation_ = 0;
+    size_t active_threads_ = 1;
+    size_t total_work_ = 0;
+    size_t remaining_workers_ = 0;
+    JobFn job_fn_;
+};
+
+static TinyThreadPool& get_thread_pool(size_t requested_threads) {
+    const size_t threads = std::max<size_t>(1, requested_threads);
+    thread_local std::unique_ptr<TinyThreadPool> pool;
+    thread_local size_t pool_threads = 0;
+    if (!pool || pool_threads != threads) {
+        pool = std::make_unique<TinyThreadPool>(threads);
+        pool_threads = threads;
+    }
+    return *pool;
+}
+
+template <typename Fn>
+static inline void run_parallel_for(size_t requested_threads, size_t total, Fn&& fn) {
+    if (total == 0) {
+        return;
+    }
+    const size_t threads = std::max<size_t>(1, requested_threads);
+    if (threads <= 1 || total <= 1) {
+        fn(0, total);
+        return;
+    }
+    TinyThreadPool& pool = get_thread_pool(threads);
+    pool.parallel_for(total, std::forward<Fn>(fn));
 }
 
 //--------------------DSU (Disjoint Set Union)------------------------------------
@@ -482,17 +640,7 @@ void update_cluster_dissimilarities(
         if (cross_threads <= 1 || batch_size < 128) {
             precompute_cross_range(0, batch_size);
         } else {
-            std::vector<std::thread> threads;
-            threads.reserve(cross_threads);
-            const size_t chunk_size = batch_size / cross_threads;
-            const size_t chunk_remainder = batch_size % cross_threads;
-            size_t start = 0;
-            for (size_t t = 0; t < cross_threads; t++) {
-                const size_t end = start + chunk_size + (t < chunk_remainder ? 1 : 0);
-                threads.emplace_back(precompute_cross_range, start, end);
-                start = end;
-            }
-            for (auto& thread : threads) thread.join();
+            run_parallel_for(requested_threads, batch_size, precompute_cross_range);
         }
 
         // Parallel column computation (unchanged).
@@ -529,17 +677,7 @@ void update_cluster_dissimilarities(
         if (no_threads <= 1) {
             compute_range(0, batch_size);
         } else {
-            std::vector<std::thread> threads;
-            threads.reserve(no_threads);
-            size_t chunk_size = batch_size / no_threads;
-            size_t remainder = batch_size % no_threads;
-            size_t start = 0;
-            for (size_t t = 0; t < no_threads; t++) {
-                size_t end = start + chunk_size + (t < remainder ? 1 : 0);
-                threads.emplace_back(compute_range, start, end);
-                start = end;
-            }
-            for (auto& thread : threads) thread.join();
+            run_parallel_for(requested_threads, batch_size, compute_range);
         }
 
         // Serial write-back for merge mains.
@@ -1363,17 +1501,7 @@ void update_cluster_nn_dist(
     if (no_threads <= 1) {
         rescan_range(0, count);
     } else {
-        std::vector<std::thread> threads;
-        threads.reserve(no_threads);
-        size_t chunk = count / no_threads;
-        size_t remainder = count % no_threads;
-        size_t start = 0;
-        for (size_t t = 0; t < no_threads; t++) {
-            size_t end = start + chunk + (t < remainder ? 1 : 0);
-            threads.emplace_back(rescan_range, start, end);
-            start = end;
-        }
-        for (auto& th : threads) th.join();
+        run_parallel_for(requested, count, rescan_range);
     }
 
     // Clean up (resets both 1 and 2 to 0).
@@ -1611,11 +1739,12 @@ void RAC_i(
             // Build compact distance matrix (parallel by row).
             SymDistMatrix new_dist(A);
             {
-                auto copy_range = [&](int start, int end) {
-                    for (int i = start; i < end; i++) {
-                        const int oi = compact_to_orig[i];
-                        for (int j = i + 1; j < A; j++) {
-                            new_dist.data[new_dist.tri_idx(i, j)] =
+                auto copy_range = [&](size_t start, size_t end) {
+                    for (size_t i = start; i < end; i++) {
+                        const int ii = static_cast<int>(i);
+                        const int oi = compact_to_orig[ii];
+                        for (int j = ii + 1; j < A; j++) {
+                            new_dist.data[new_dist.tri_idx(ii, j)] =
                                 static_cast<SymDistScalar>(
                                     dist.get(oi, compact_to_orig[j]));
                         }
@@ -1627,18 +1756,7 @@ void RAC_i(
                 if (nt <= 1) {
                     copy_range(0, A);
                 } else {
-                    std::vector<std::thread> threads;
-                    threads.reserve(nt);
-                    size_t chunk = A / nt;
-                    size_t rem = A % nt;
-                    size_t s = 0;
-                    for (size_t t = 0; t < nt; t++) {
-                        size_t e = s + chunk + (t < rem ? 1 : 0);
-                        threads.emplace_back(copy_range,
-                            static_cast<int>(s), static_cast<int>(e));
-                        s = e;
-                    }
-                    for (auto& th : threads) th.join();
+                    run_parallel_for(req, static_cast<size_t>(A), copy_range);
                 }
             }
             dist = std::move(new_dist);
