@@ -24,6 +24,7 @@ namespace py = pybind11;
 #include <mutex>
 #include <condition_variable>
 #include <type_traits>
+#include <atomic>
 // #define EIGEN_DONT_PARALLELIZE
 #include "Eigen/Dense"
 #include "Eigen/Sparse"
@@ -759,13 +760,34 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
         }
     }
 
-    // Phase 1: Parallel tile GEMM + storage (no NN tracking).
+    // Phase 1: Parallel tile GEMM + storage + thread-local NN tracking.
     // Each tile pair writes to a disjoint region of dist.data, so no races.
     // Single-threaded GEMM per tile avoids Eigen thread sync overhead.
+    const size_t local_slots = std::min(n_threads, tile_pairs.size());
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<double>> nn_best_locals(
+        local_slots, std::vector<double>(N, inf));
+    std::vector<std::vector<int>> nn_idx_locals(
+        local_slots, std::vector<int>(N, -1));
+    std::atomic<size_t> slot_counter{0};
+
     const int saved_threads = Eigen::nbThreads();
     Eigen::setNbThreads(1);
 
     run_parallel_for(n_threads, tile_pairs.size(), [&](size_t start, size_t end) {
+        const size_t slot = slot_counter.fetch_add(1, std::memory_order_relaxed);
+        std::vector<double>& nn_best_local = nn_best_locals[slot];
+        std::vector<int>& nn_idx_local = nn_idx_locals[slot];
+
+        auto update_local_nn = [&](int src, int dst, double val) {
+            double& best = nn_best_local[src];
+            int& idx = nn_idx_local[src];
+            if (val < best || (val == best && (idx == -1 || dst < idx))) {
+                best = val;
+                idx = dst;
+            }
+        };
+
         Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> tile;
 
         for (size_t t = start; t < end; t++) {
@@ -800,12 +822,22 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                         dist.row_start[static_cast<size_t>(i_global)];
                     if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
                         for (int c = c_start; c < tile_j; c++) {
-                            dist.data[base_idx + (c - c_start)] = tile(r, c);
+                            const Scalar v = tile(r, c);
+                            dist.data[base_idx + (c - c_start)] = v;
+                            const int j_global = tp.j_start + c;
+                            const double val = static_cast<double>(v);
+                            update_local_nn(i_global, j_global, val);
+                            update_local_nn(j_global, i_global, val);
                         }
                     } else {
                         for (int c = c_start; c < tile_j; c++) {
+                            const Scalar v = tile(r, c);
                             dist.data[base_idx + (c - c_start)] =
-                                static_cast<SymDistScalar>(tile(r, c));
+                                static_cast<SymDistScalar>(v);
+                            const int j_global = tp.j_start + c;
+                            const double val = static_cast<double>(v);
+                            update_local_nn(i_global, j_global, val);
+                            update_local_nn(j_global, i_global, val);
                         }
                     }
                 }
@@ -819,12 +851,22 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                         static_cast<size_t>(tp.j_start - i_global - 1);
                     if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
                         for (int c = 0; c < tile_j; c++) {
-                            dist.data[base_idx + c] = tile(r, c);
+                            const Scalar v = tile(r, c);
+                            dist.data[base_idx + c] = v;
+                            const int j_global = tp.j_start + c;
+                            const double val = static_cast<double>(v);
+                            update_local_nn(i_global, j_global, val);
+                            update_local_nn(j_global, i_global, val);
                         }
                     } else {
                         for (int c = 0; c < tile_j; c++) {
+                            const Scalar v = tile(r, c);
                             dist.data[base_idx + c] =
-                                static_cast<SymDistScalar>(tile(r, c));
+                                static_cast<SymDistScalar>(v);
+                            const int j_global = tp.j_start + c;
+                            const double val = static_cast<double>(v);
+                            update_local_nn(i_global, j_global, val);
+                            update_local_nn(j_global, i_global, val);
                         }
                     }
                 }
@@ -834,14 +876,26 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
 
     Eigen::setNbThreads(saved_threads);
 
-    // Phase 2: Parallel NN computation from stored distances.
-    // Cost: ~N column scans of ~N entries each
-    run_parallel_for(n_threads, static_cast<size_t>(N), [&](size_t start, size_t end) {
-        for (size_t k = start; k < end; k++) {
-            auto [min_val, min_idx] = dist.min_in_col(static_cast<int>(k));
-            clusters[k].nn = (min_val < max_merge_distance) ? min_idx : -1;
+    // Reduce thread-local NN tracking deterministically.
+    std::vector<double> nn_best(N, inf);
+    std::vector<int> nn_idx(N, -1);
+    for (size_t s = 0; s < local_slots; s++) {
+        const std::vector<double>& local_best = nn_best_locals[s];
+        const std::vector<int>& local_idx = nn_idx_locals[s];
+        for (int k = 0; k < N; k++) {
+            const int idx = local_idx[k];
+            if (idx < 0) continue;
+            const double val = local_best[k];
+            if (val < nn_best[k] || (val == nn_best[k] && (nn_idx[k] == -1 || idx < nn_idx[k]))) {
+                nn_best[k] = val;
+                nn_idx[k] = idx;
+            }
         }
-    });
+    }
+
+    for (int k = 0; k < N; k++) {
+        clusters[k].nn = (nn_best[k] < max_merge_distance) ? nn_idx[k] : -1;
+    }
 
     return dist;
 }
