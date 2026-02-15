@@ -226,7 +226,8 @@ void update_cluster_dissimilarities(
     const int NO_PROCESSORS,
     std::vector<int>& dsu_parent,
     std::vector<int>& dsu_size,
-    std::vector<SymDistVector>& merged_columns_workspace);
+    std::vector<SymDistVector>& merged_columns_workspace,
+    double max_merge_distance);
 
 SymDistMatrix calculate_initial_dissimilarities(
     Eigen::MatrixXd& base_arr,

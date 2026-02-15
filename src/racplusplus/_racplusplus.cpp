@@ -363,7 +363,8 @@ void update_cluster_dissimilarities(
     const int NO_PROCESSORS,
     std::vector<int>& dsu_parent,
     std::vector<int>& dsu_size,
-    std::vector<SymDistVector>& merged_columns_workspace) {
+    std::vector<SymDistVector>& merged_columns_workspace,
+    double max_merge_distance) {
 
     if (merges.empty()) {
         return;
@@ -374,7 +375,6 @@ void update_cluster_dissimilarities(
     const size_t MERGE_BATCH = 1024;
     const size_t requested_threads = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
 
-    // Reusable column buffers (persist across RAC iterations for this RAC invocation).
     auto& merged_columns = merged_columns_workspace;
     const size_t max_batch = std::min(merge_count, MERGE_BATCH);
     if (merged_columns.size() < max_batch) {
@@ -386,13 +386,16 @@ void update_cluster_dissimilarities(
         }
     }
 
+    // Persistent mask for batch secondaries (item 6).
+    static std::vector<char> is_batch_secondary;
+    if (static_cast<int>(is_batch_secondary.size()) < N) {
+        is_batch_secondary.assign(N, 0);
+    }
+
     for (size_t batch_start = 0; batch_start < merge_count; batch_start += MERGE_BATCH) {
         const size_t batch_end = std::min(batch_start + MERGE_BATCH, merge_count);
         const size_t batch_size = batch_end - batch_start;
 
-        // Prep merge metadata for this batch.
-        // Sizes come from dsu_size — correct because merges are disjoint, so
-        // this batch's clusters haven't been touched by earlier batches' unions.
         std::vector<int> merge_main_ids(batch_size);
         std::vector<int> merge_secondary_ids(batch_size);
         std::vector<double> merge_main_sizes(batch_size);
@@ -403,7 +406,6 @@ void update_cluster_dissimilarities(
             const size_t global_i = batch_start + i;
             merge_main_ids[i] = merges[global_i].first;
             merge_secondary_ids[i] = merges[global_i].second;
-
             merge_main_sizes[i] = static_cast<double>(dsu_size[merge_main_ids[i]]);
             merge_secondary_sizes[i] = static_cast<double>(dsu_size[merge_secondary_ids[i]]);
             merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
@@ -422,23 +424,19 @@ void update_cluster_dissimilarities(
                 const double sz_mi = merge_main_sizes[i];
                 const double sz_si = merge_secondary_sizes[i];
                 const double inv_i = merge_inv_sizes[i];
-
                 for (size_t j = i + 1; j < batch_size; j++) {
                     const int mj = merge_main_ids[j];
                     const int sj = merge_secondary_ids[j];
                     const double sz_mj = merge_main_sizes[j];
                     const double sz_sj = merge_secondary_sizes[j];
                     const double inv_j = merge_inv_sizes[j];
-
                     const double d_mi_mj = dist.get(mi, mj);
                     const double d_mi_sj = dist.get(mi, sj);
                     const double d_si_mj = dist.get(si, mj);
                     const double d_si_sj = dist.get(si, sj);
-
                     const double d_mi_to_j = (sz_mj * d_mi_mj + sz_sj * d_mi_sj) * inv_j;
                     const double d_si_to_j = (sz_mj * d_si_mj + sz_sj * d_si_sj) * inv_j;
                     const double d_ij = (sz_mi * d_mi_to_j + sz_si * d_si_to_j) * inv_i;
-
                     const SymDistScalar val = static_cast<SymDistScalar>(d_ij);
                     cross_dist[i * batch_size + j] = val;
                     cross_dist[j * batch_size + i] = val;
@@ -453,17 +451,17 @@ void update_cluster_dissimilarities(
             std::vector<std::thread> threads;
             threads.reserve(cross_threads);
             const size_t chunk_size = batch_size / cross_threads;
-            const size_t remainder = batch_size % cross_threads;
+            const size_t chunk_remainder = batch_size % cross_threads;
             size_t start = 0;
             for (size_t t = 0; t < cross_threads; t++) {
-                const size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+                const size_t end = start + chunk_size + (t < chunk_remainder ? 1 : 0);
                 threads.emplace_back(precompute_cross_range, start, end);
                 start = end;
             }
             for (auto& thread : threads) thread.join();
         }
 
-        // Parallel compute for this batch.
+        // Parallel column computation (unchanged).
         auto compute_range = [&](size_t start, size_t end) {
             const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
             SymDistVector main_col(N);
@@ -472,17 +470,15 @@ void update_cluster_dissimilarities(
             for (size_t i = start; i < end; i++) {
                 const int main_id = merge_main_ids[i];
                 const int secondary_id = merge_secondary_ids[i];
-                const double main_size = merge_main_sizes[i];
-                const double secondary_size = merge_secondary_sizes[i];
-                const double inv_ab = merge_inv_sizes[i];
-                const SymDistScalar main_weight = static_cast<SymDistScalar>(main_size * inv_ab);
-                const SymDistScalar secondary_weight = static_cast<SymDistScalar>(secondary_size * inv_ab);
+                const SymDistScalar main_weight =
+                    static_cast<SymDistScalar>(merge_main_sizes[i] * merge_inv_sizes[i]);
+                const SymDistScalar secondary_weight =
+                    static_cast<SymDistScalar>(merge_secondary_sizes[i] * merge_inv_sizes[i]);
 
                 dist.get_col_into(main_id, main_col);
                 dist.get_col_into(secondary_id, sec_col);
                 merged_columns[i].noalias() = main_weight * main_col + secondary_weight * sec_col;
 
-                // Patch only with other merges in this batch using precomputed values.
                 for (size_t j = 0; j < batch_size; j++) {
                     if (j == i) continue;
                     const SymDistScalar patched = cross_dist[i * batch_size + j];
@@ -496,7 +492,6 @@ void update_cluster_dissimilarities(
         };
 
         size_t no_threads = std::min(requested_threads, batch_size);
-
         if (no_threads <= 1) {
             compute_range(0, batch_size);
         } else {
@@ -522,6 +517,38 @@ void update_cluster_dissimilarities(
         }
         for (size_t i = 0; i < batch_size; i++) {
             dist.fill_infinity(merge_secondary_ids[i]);
+        }
+        // ITEM 6: Compute NN for merge mains from contiguous merged_columns,
+        // but ONLY for the last batch. Earlier batches' mains get stale NNs
+        // because later batches modify distances — those are handled by
+        // update_cluster_nn_dist instead.
+        const bool is_last_batch = (batch_end >= merge_count);
+        if (is_last_batch) {
+            for (size_t i = 0; i < batch_size; i++) {
+                is_batch_secondary[merge_secondary_ids[i]] = 1;
+            }
+
+            for (size_t i = 0; i < batch_size; i++) {
+                const int main_id = merge_main_ids[i];
+                const SymDistScalar* col_data = merged_columns[i].data();
+                SymDistScalar best_val = std::numeric_limits<SymDistScalar>::infinity();
+                int best_idx = -1;
+
+                for (int k = 0; k < N; k++) {
+                    if (is_batch_secondary[k]) continue;
+                    if (col_data[k] < best_val) {
+                        best_val = col_data[k];
+                        best_idx = k;
+                    }
+                }
+
+                clusters[main_id].nn =
+                    (static_cast<double>(best_val) < max_merge_distance) ? best_idx : -1;
+            }
+
+            for (size_t i = 0; i < batch_size; i++) {
+                is_batch_secondary[merge_secondary_ids[i]] = 0;
+            }
         }
     }
 }
@@ -1208,41 +1235,57 @@ void update_cluster_nn_dist(
     const SymDistMatrix& dist,
     double max_merge_distance,
     const std::vector<std::pair<int, int>>& merges,
-    const int NO_PROCESSORS) {
+    const int NO_PROCESSORS,
+    std::vector<char>& is_dead_ws,
+    std::vector<char>& is_changed_ws) {
 
     if (merges.empty()) return;
 
     const int N = dist.N;
+    if (static_cast<int>(is_dead_ws.size()) < N) is_dead_ws.assign(N, 0);
+    if (static_cast<int>(is_changed_ws.size()) < N) is_changed_ws.assign(N, 0);
 
-    // O(1) lookup: secondary (dead) or main (distance column rewritten).
-    std::vector<char> is_dead(N, 0);
-    std::vector<char> is_changed(N, 0);
+    // Last-batch boundary (must match MERGE_BATCH in update_cluster_dissimilarities).
+    const size_t MERGE_BATCH = 1024;
+    const size_t last_batch_start =
+        ((merges.size() - 1) / MERGE_BATCH) * MERGE_BATCH;
+
+    // Mark all mains as changed=1, all secondaries as dead.
     for (const auto& m : merges) {
-        is_changed[m.first] = 1;
-        is_dead[m.second] = 1;
+        is_changed_ws[m.first] = 1;
+        is_dead_ws[m.second] = 1;
+    }
+    // Upgrade last-batch mains to changed=2 (NN fresh from write-back, skip).
+    for (size_t i = last_batch_start; i < merges.size(); i++) {
+        is_changed_ws[merges[i].first] = 2;
     }
 
-    // Only rescan clusters whose NN was invalidated.
-    // Skip secondaries (about to be removed; min_in_col returns inf anyway).
-    // Skip clusters whose NN is alive and unchanged — their NN is still valid.
     std::vector<int> needs_rescan;
     needs_rescan.reserve(active_indices.size());
     for (int idx : active_indices) {
         const int cid = clusters[idx].id;
-        if (is_dead[cid]) continue;
-
+        if (is_dead_ws[cid]) continue;           // secondary: about to die
+        if (is_changed_ws[cid] == 2) continue;   // last-batch main: NN fresh
+        if (is_changed_ws[cid] == 1) {
+            // earlier-batch main: later batches changed distances, NN stale
+            needs_rescan.push_back(idx);
+            continue;
+        }
+        // Bystander: rescan only if NN was invalidated.
+        // is_changed_ws[old_nn] catches both ==1 and ==2 (any main).
         const int old_nn = clusters[idx].nn;
-        const bool nn_invalidated =
-            is_changed[cid] ||
-            (old_nn != -1 && (is_dead[old_nn] || is_changed[old_nn]));
-
-        if (nn_invalidated) {
+        if (old_nn != -1 && (is_dead_ws[old_nn] || is_changed_ws[old_nn])) {
             needs_rescan.push_back(idx);
         }
     }
 
+    // Clean up (resets both 1 and 2 to 0).
+    for (const auto& m : merges) {
+        is_changed_ws[m.first] = 0;
+        is_dead_ws[m.second] = 0;
+    }
+
     if (needs_rescan.empty()) return;
-    std::sort(needs_rescan.begin(), needs_rescan.end());
 
     auto rescan_range = [&](size_t start, size_t end) {
         for (size_t i = start; i < end; i++) {
@@ -1267,7 +1310,7 @@ void update_cluster_nn_dist(
             threads.emplace_back(rescan_range, start, end);
             start = end;
         }
-        for (auto& thread : threads) thread.join();
+        for (auto& th : threads) th.join();
     }
 }
 
@@ -1421,41 +1464,173 @@ void RAC_i(
     std::vector<int>& dsu_size
     ) {
 
-    long total_dissim = 0, total_nn = 0, total_remove = 0, total_find = 0;
+    long total_dissim = 0, total_nn = 0, total_remove = 0, total_find = 0, total_compact = 0;
     int iteration = 0;
     std::vector<SymDistVector> merged_columns_workspace;
+
+    const int orig_N = dist.N;
+
     std::vector<int> active_pos(clusters.size(), -1);
     for (size_t i = 0; i < active_indices.size(); i++) {
         active_pos[active_indices[i]] = static_cast<int>(i);
     }
 
+    // Persistent workspaces for update_cluster_nn_dist.
+    std::vector<char> is_dead_ws(orig_N, 0);
+    std::vector<char> is_changed_ws(orig_N, 0);
+
+    // Compaction state.
+    bool did_compact = false;
+    std::vector<int> orig_dsu_parent;
+    std::vector<int> compact_to_orig;
+
     std::vector<std::pair<int, int>> merges = find_reciprocal_nn(clusters, active_indices);
-    while (merges.size() != 0) {
+    while (!merges.empty()) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS, dsu_parent, dsu_size, merged_columns_workspace);
+        update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS,
+                                       dsu_parent, dsu_size, merged_columns_workspace,
+                                       max_merge_distance);
         auto t1 = std::chrono::high_resolution_clock::now();
 
-        update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance, merges, NO_PROCESSORS);
+        // Mirror merges into original DSU for final label assignment.
+        if (did_compact) {
+            for (const auto& m : merges) {
+                int orig_main = dsu_find(orig_dsu_parent, compact_to_orig[m.first]);
+                int orig_sec  = dsu_find(orig_dsu_parent, compact_to_orig[m.second]);
+                orig_dsu_parent[orig_sec] = orig_main;
+            }
+        }
+
+        update_cluster_nn_dist(clusters, active_indices, dist, max_merge_distance,
+                               merges, NO_PROCESSORS, is_dead_ws, is_changed_ws);
         auto t2 = std::chrono::high_resolution_clock::now();
 
         remove_secondary_clusters(merges, clusters, active_indices, active_pos);
         auto t3 = std::chrono::high_resolution_clock::now();
 
+        // =================================================================
+        // ITEM 5: Compact when active count drops below half of current N.
+        // Rebuilds dist, clusters, DSU in [0..A) space so that min_in_col,
+        // get_col_into, etc. scan A entries instead of N.
+        // =================================================================
+        if (!did_compact &&
+            active_indices.size() * 2 < static_cast<size_t>(dist.N) &&
+            active_indices.size() > 1) {
+
+            const int A = static_cast<int>(active_indices.size());
+
+            std::vector<int> sorted_active = active_indices;
+            std::sort(sorted_active.begin(), sorted_active.end());
+
+            compact_to_orig.resize(A);
+            std::vector<int> orig_to_compact(dist.N, -1);
+            for (int i = 0; i < A; i++) {
+                compact_to_orig[i] = sorted_active[i];
+                orig_to_compact[sorted_active[i]] = i;
+            }
+
+            // Save original DSU for label assignment.
+            orig_dsu_parent = dsu_parent;
+
+            // Build compact distance matrix (parallel by row).
+            SymDistMatrix new_dist(A);
+            {
+                auto copy_range = [&](int start, int end) {
+                    for (int i = start; i < end; i++) {
+                        const int oi = compact_to_orig[i];
+                        for (int j = i + 1; j < A; j++) {
+                            new_dist.data[new_dist.tri_idx(i, j)] =
+                                static_cast<SymDistScalar>(
+                                    dist.get(oi, compact_to_orig[j]));
+                        }
+                    }
+                };
+
+                const size_t req = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
+                const size_t nt = std::min(req, static_cast<size_t>(A));
+                if (nt <= 1) {
+                    copy_range(0, A);
+                } else {
+                    std::vector<std::thread> threads;
+                    threads.reserve(nt);
+                    size_t chunk = A / nt;
+                    size_t rem = A % nt;
+                    size_t s = 0;
+                    for (size_t t = 0; t < nt; t++) {
+                        size_t e = s + chunk + (t < rem ? 1 : 0);
+                        threads.emplace_back(copy_range,
+                            static_cast<int>(s), static_cast<int>(e));
+                        s = e;
+                    }
+                    for (auto& th : threads) th.join();
+                }
+            }
+            dist = std::move(new_dist);
+
+            // Rebuild clusters with compact IDs.
+            std::vector<Cluster> new_clusters;
+            new_clusters.reserve(A);
+            for (int i = 0; i < A; i++) {
+                new_clusters.emplace_back(i);
+                Cluster& oc = clusters[compact_to_orig[i]];
+                new_clusters[i].nn =
+                    (oc.nn >= 0 && orig_to_compact[oc.nn] >= 0)
+                        ? orig_to_compact[oc.nn] : -1;
+            }
+            clusters = std::move(new_clusters);
+
+            // Rebuild active state.
+            active_indices.resize(A);
+            std::iota(active_indices.begin(), active_indices.end(), 0);
+            active_pos.assign(A, 0);
+            std::iota(active_pos.begin(), active_pos.end(), 0);
+
+            // Rebuild compact DSU.
+            std::vector<int> new_dsu_size(A);
+            for (int i = 0; i < A; i++) {
+                new_dsu_size[i] = dsu_size[compact_to_orig[i]];
+            }
+            dsu_parent.resize(A);
+            std::iota(dsu_parent.begin(), dsu_parent.end(), 0);
+            dsu_size = std::move(new_dsu_size);
+
+            // Resize workspaces.
+            merged_columns_workspace.clear();
+            is_dead_ws.assign(A, 0);
+            is_changed_ws.assign(A, 0);
+
+            did_compact = true;
+
+            auto tc = std::chrono::high_resolution_clock::now();
+            total_compact += std::chrono::duration_cast<std::chrono::milliseconds>(tc - t3).count();
+            std::cerr << "Compacted: " << orig_N << " -> " << A
+                      << " ("
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(tc - t3).count()
+                      << "ms)" << std::endl;
+        }
+
+        auto t4_start = std::chrono::high_resolution_clock::now();
         merges = find_reciprocal_nn(clusters, active_indices);
         auto t4 = std::chrono::high_resolution_clock::now();
 
         total_dissim += std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         total_nn += std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
         total_remove += std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-        total_find += std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+        total_find += std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t4_start).count();
         iteration++;
+    }
+
+    // Restore original DSU for label assignment.
+    if (did_compact) {
+        dsu_parent = std::move(orig_dsu_parent);
     }
 
     std::cerr << "RAC_i iterations: " << iteration
               << " | dissim: " << total_dissim << "ms"
               << " | nn_dist: " << total_nn << "ms"
               << " | remove: " << total_remove << "ms"
-              << " | find_rnn: " << total_find << "ms" << std::endl;
+              << " | find_rnn: " << total_find << "ms"
+              << " | compact: " << total_compact << "ms" << std::endl;
 }
 
 template <typename Scalar>
