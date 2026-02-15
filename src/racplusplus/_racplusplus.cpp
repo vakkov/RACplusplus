@@ -388,6 +388,41 @@ void update_cluster_dissimilarities(
             merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
         }
 
+        // Precompute intra-batch merged-to-merged distances once.
+        // This avoids repeated random dist.get() calls in the per-column loop.
+        std::vector<SymDistScalar> cross_dist(
+            batch_size * batch_size,
+            std::numeric_limits<SymDistScalar>::infinity());
+
+        for (size_t i = 0; i < batch_size; i++) {
+            const int mi = merge_main_ids[i];
+            const int si = merge_secondary_ids[i];
+            const double sz_mi = merge_main_sizes[i];
+            const double sz_si = merge_secondary_sizes[i];
+            const double inv_i = merge_inv_sizes[i];
+
+            for (size_t j = i + 1; j < batch_size; j++) {
+                const int mj = merge_main_ids[j];
+                const int sj = merge_secondary_ids[j];
+                const double sz_mj = merge_main_sizes[j];
+                const double sz_sj = merge_secondary_sizes[j];
+                const double inv_j = merge_inv_sizes[j];
+
+                const double d_mi_mj = dist.get(mi, mj);
+                const double d_mi_sj = dist.get(mi, sj);
+                const double d_si_mj = dist.get(si, mj);
+                const double d_si_sj = dist.get(si, sj);
+
+                const double d_mi_to_j = (sz_mj * d_mi_mj + sz_sj * d_mi_sj) * inv_j;
+                const double d_si_to_j = (sz_mj * d_si_mj + sz_sj * d_si_sj) * inv_j;
+                const double d_ij = (sz_mi * d_mi_to_j + sz_si * d_si_to_j) * inv_i;
+
+                const SymDistScalar val = static_cast<SymDistScalar>(d_ij);
+                cross_dist[i * batch_size + j] = val;
+                cross_dist[j * batch_size + i] = val;
+            }
+        }
+
         // Parallel compute for this batch.
         auto compute_range = [&](size_t start, size_t end) {
             const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
@@ -407,26 +442,12 @@ void update_cluster_dissimilarities(
                 dist.get_col_into(secondary_id, sec_col);
                 merged_columns[i].noalias() = main_weight * main_col + secondary_weight * sec_col;
 
-                // Patch: only for other merges within THIS batch.
-                // Cross-batch merges are already reflected in dist from earlier write-backs.
+                // Patch only with other merges in this batch using precomputed values.
                 for (size_t j = 0; j < batch_size; j++) {
-                    if (merge_main_ids[j] == main_id || merge_secondary_ids[j] == main_id) continue;
-
-                    const int merge_main = merge_main_ids[j];
-                    const int merge_secondary = merge_secondary_ids[j];
-                    const double inv_cd = merge_inv_sizes[j];
-
-                    const double dist_main_to_cd =
-                        (merge_main_sizes[j] * dist.get(merge_main, main_id) +
-                         merge_secondary_sizes[j] * dist.get(merge_secondary, main_id)) * inv_cd;
-                    const double dist_secondary_to_cd =
-                        (merge_main_sizes[j] * dist.get(merge_main, secondary_id) +
-                         merge_secondary_sizes[j] * dist.get(merge_secondary, secondary_id)) * inv_cd;
-
-                    const double dist_ab_to_cd = (main_size * dist_main_to_cd + secondary_size * dist_secondary_to_cd) * inv_ab;
-                    const SymDistScalar dist_val = static_cast<SymDistScalar>(dist_ab_to_cd);
-                    merged_columns[i][merge_main] = dist_val;
-                    merged_columns[i][merge_secondary] = dist_val;
+                    if (j == i) continue;
+                    const SymDistScalar patched = cross_dist[i * batch_size + j];
+                    merged_columns[i][merge_main_ids[j]] = patched;
+                    merged_columns[i][merge_secondary_ids[j]] = patched;
                 }
 
                 merged_columns[i][main_id] = inf;
@@ -903,52 +924,44 @@ void merge_clusters_compute(
     }
 }
 
-std::vector<std::vector<std::pair<int, int> > > chunk_merges(std::vector<std::pair<int, int> >& merges, size_t no_threads) {
-    std::vector<std::vector<std::pair<int, int> > > merge_chunks(no_threads);
-
-    size_t chunk_size = merges.size() / no_threads;
-    size_t remainder = merges.size() % no_threads;
-
-    size_t start = 0, end = 0;
-    for (size_t i = 0; i < no_threads; i++) {
-        end = start + chunk_size;
-        if (i < remainder) { // distribute the remainder among the first "remainder" chunks
-            end++;
-        }
-
-        // Create chunks by using the range constructor of std::vector
-        if (end <= merges.size()) {
-            merge_chunks[i] = std::vector<std::pair<int, int> >(merges.begin() + start, merges.begin() + end);
-        }
-        start = end;
-    }
-
-    return merge_chunks;
-}
-
 void parallel_merge_clusters(
     std::vector<std::pair<int, int> >& merges,
     std::vector<Cluster>& clusters,
     size_t no_threads,
     std::vector<std::vector<std::pair<int, double>>>& merging_arrays) {
 
-    std::vector<std::thread> threads;
-
-    std::vector<std::vector<std::pair<int, int>>> merge_chunks;
-    merge_chunks = chunk_merges(merges, no_threads);
-
-    for (size_t i=0; i<no_threads; i++) {
-        std::thread merge_thread = std::thread(
-            merge_clusters_symmetric,
-            std::ref(merge_chunks[i]),
-            std::ref(clusters),
-            std::ref(merging_arrays[i]));
-
-        threads.push_back(std::move(merge_thread));
+    const size_t total = merges.size();
+    if (total == 0) {
+        return;
     }
 
-    for (size_t i=0; i<no_threads; i++) {
-        threads[i].join();
+    const size_t requested_threads = (no_threads > 0) ? no_threads : 1;
+    const size_t worker_count = std::min(requested_threads, total);
+
+    if (worker_count <= 1) {
+        merge_clusters_symmetric(merges, clusters, merging_arrays[0]);
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(worker_count);
+
+    const size_t chunk_size = total / worker_count;
+    const size_t remainder = total % worker_count;
+    size_t start = 0;
+
+    for (size_t t = 0; t < worker_count; t++) {
+        const size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+        threads.emplace_back([&merges, &clusters, &merging_arrays, start, end, t]() {
+            for (size_t i = start; i < end; i++) {
+                merge_cluster_symmetric_linkage(merges[i], clusters, merging_arrays[t]);
+            }
+        });
+        start = end;
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
     }
 }
 
@@ -959,24 +972,38 @@ void parallel_merge_clusters(
     std::vector<std::vector<int>>& merging_arrays,
     Eigen::MatrixXd& base_arr) {
 
-    std::vector<std::thread> threads;
-
-    std::vector<std::vector<std::pair<int, int>>> merge_chunks;
-    merge_chunks = chunk_merges(merges, no_threads);
-
-    for (size_t i=0; i<no_threads; i++) {
-        std::thread merge_thread = std::thread(
-            merge_clusters_compute,
-            std::ref(merge_chunks[i]),
-            std::ref(clusters),
-            std::ref(merging_arrays[i]),
-            std::ref(base_arr));
-
-        threads.push_back(std::move(merge_thread));
+    const size_t total = merges.size();
+    if (total == 0) {
+        return;
     }
 
-    for (size_t i=0; i<no_threads; i++) {
-        threads[i].join();
+    const size_t requested_threads = (no_threads > 0) ? no_threads : 1;
+    const size_t worker_count = std::min(requested_threads, total);
+
+    if (worker_count <= 1) {
+        merge_clusters_compute(merges, clusters, merging_arrays[0], base_arr);
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(worker_count);
+
+    const size_t chunk_size = total / worker_count;
+    const size_t remainder = total % worker_count;
+    size_t start = 0;
+
+    for (size_t t = 0; t < worker_count; t++) {
+        const size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+        threads.emplace_back([&merges, &clusters, &merging_arrays, &base_arr, start, end, t]() {
+            for (size_t i = start; i < end; i++) {
+                merge_cluster_compute_linkage(merges[i], clusters, merging_arrays[t], base_arr);
+            }
+        });
+        start = end;
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
     }
 }
 //-----------------------End Merging Functions-----------------------------------
@@ -1054,38 +1081,42 @@ void parallel_update_clusters(
     std::vector<int>& neighbor_sort_arr,
     size_t no_threads) {
 
+    const size_t total = updates.size();
+    if (total == 0) {
+        return;
+    }
+
+    const size_t requested_threads = (no_threads > 0) ? no_threads : 1;
+    const size_t worker_count = std::min(requested_threads, total);
+
+    if (worker_count <= 1) {
+        for (size_t i = 0; i < total; i++) {
+            update_cluster_neighbors(updates[i], clusters, update_neighbors_arrays[0]);
+            neighbor_sort_arr[updates[i].first] = -1;
+        }
+        return;
+    }
+
     std::vector<std::thread> threads;
-    std::vector<std::vector<std::pair<int, std::vector<std::pair<int, double>>>>> update_chunks(no_threads);
+    threads.reserve(worker_count);
 
-    size_t chunk_size = updates.size() / no_threads;
-    size_t remainder = updates.size() % no_threads;
+    const size_t chunk_size = total / worker_count;
+    const size_t remainder = total % worker_count;
+    size_t start = 0;
 
-    size_t start = 0, end = 0;
-    for (size_t i = 0; i < no_threads; i++) {
-        end = start + chunk_size;
-        if (i < remainder) { // distribute the remainder among the first "remainder" chunks
-            end++;
-        }
-
-        if (end <= updates.size()) {
-            update_chunks[i] = std::vector<std::pair<int, std::vector<std::pair<int, double> > > >(updates.begin() + start, updates.begin() + end);
-        }
+    for (size_t t = 0; t < worker_count; t++) {
+        const size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+        threads.emplace_back([&updates, &clusters, &neighbor_sort_arr, &update_neighbors_arrays, start, end, t]() {
+            for (size_t i = start; i < end; i++) {
+                update_cluster_neighbors(updates[i], clusters, update_neighbors_arrays[t]);
+                neighbor_sort_arr[updates[i].first] = -1;
+            }
+        });
         start = end;
     }
 
-    for (size_t i=0; i<no_threads; i++) {
-        std::thread update_thread = std::thread(
-            update_cluster_neighbors_p,
-            std::ref(update_chunks[i]),
-            std::ref(clusters),
-            std::ref(neighbor_sort_arr),
-            std::ref(update_neighbors_arrays[i]));
-
-        threads.push_back(std::move(update_thread));
-    }
-
-    for (size_t i=0; i<no_threads; i++) {
-        threads[i].join();
+    for (auto& thread : threads) {
+        thread.join();
     }
 }
 
@@ -1198,39 +1229,40 @@ void paralell_update_cluster_nn(
 
     // Get unique nn indices
     std::vector<int> unique_nn = get_unique_nn(clusters, active_indices, nn_count);
+    const size_t total = unique_nn.size();
+    if (total == 0) {
+        return;
+    }
+
+    const size_t requested_threads = (no_threads > 0) ? no_threads : 1;
+    const size_t worker_count = std::min(requested_threads, total);
+
+    if (worker_count <= 1) {
+        update_cluster_nn(clusters, unique_nn, max_merge_distance, nn_count);
+        return;
+    }
 
     std::vector<std::thread> threads;
-    std::vector<std::vector<int>> index_chunks(no_threads);
+    threads.reserve(worker_count);
 
-    size_t chunk_size = unique_nn.size() / no_threads;
-    size_t remainder = unique_nn.size() % no_threads;
+    const size_t chunk_size = total / worker_count;
+    const size_t remainder = total % worker_count;
+    size_t start = 0;
 
-    size_t start = 0, end = 0;
-    for (size_t i = 0; i < no_threads; i++) {
-        end = start + chunk_size;
-        if (i < remainder) {
-            end++;
-        }
-
-        if (end <= unique_nn.size()) {
-            index_chunks[i] = std::vector<int>(unique_nn.begin() + start, unique_nn.begin() + end);
-        }
+    for (size_t t = 0; t < worker_count; t++) {
+        const size_t end = start + chunk_size + (t < remainder ? 1 : 0);
+        threads.emplace_back([&clusters, &unique_nn, max_merge_distance, &nn_count, start, end]() {
+            for (size_t i = start; i < end; i++) {
+                const int cluster_idx = unique_nn[i];
+                clusters[cluster_idx].update_nn(max_merge_distance);
+                nn_count[clusters[cluster_idx].id] = 0;
+            }
+        });
         start = end;
     }
 
-    for (size_t i=0; i<no_threads; i++) {
-        std::thread update_thread = std::thread(
-            update_cluster_nn,
-            std::ref(clusters),
-            std::ref(index_chunks[i]),
-            max_merge_distance,
-            std::ref(nn_count));
-
-        threads.push_back(std::move(update_thread));
-    }
-
-    for (size_t i=0; i<no_threads; i++) {
-        threads[i].join();
+    for (auto& thread : threads) {
+        thread.join();
     }
 }
 
