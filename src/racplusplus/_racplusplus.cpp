@@ -508,15 +508,12 @@ void update_cluster_dissimilarities(
             for (auto& thread : threads) thread.join();
         }
 
-        // Serial write-back: update dist columns first, then fill infinity for secondaries.
-        // Order matters: set_col must complete for all merges before fill_infinity,
-        // otherwise fill_infinity(B) could be overwritten by a later set_col(C) writing to dist[C][B].
+        // Serial write-back for merge mains.
+        // We no longer write full secondary columns to +inf here; NN scans
+        // explicitly skip inactive/dead ids to avoid O(batch_size * N) writes.
         for (size_t i = 0; i < batch_size; i++) {
             dist.set_col(merge_main_ids[i], merged_columns[i]);
             dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
-        }
-        for (size_t i = 0; i < batch_size; i++) {
-            dist.fill_infinity(merge_secondary_ids[i]);
         }
         // ITEM 6: Compute NN for merge mains from contiguous merged_columns,
         // but ONLY for the last batch. Earlier batches' mains get stale NNs
@@ -535,6 +532,7 @@ void update_cluster_dissimilarities(
                 int best_idx = -1;
 
                 for (int k = 0; k < N; k++) {
+                    if (!clusters[k].active) continue;
                     if (is_batch_secondary[k]) continue;
                     if (col_data[k] < best_val) {
                         best_val = col_data[k];
@@ -1274,22 +1272,52 @@ void update_cluster_nn_dist(
         // Bystander: rescan only if NN was invalidated.
         // is_changed_ws[old_nn] catches both ==1 and ==2 (any main).
         const int old_nn = clusters[idx].nn;
-        if (old_nn != -1 && (is_dead_ws[old_nn] || is_changed_ws[old_nn])) {
+        if (old_nn != -1 &&
+            (!clusters[old_nn].active || is_dead_ws[old_nn] || is_changed_ws[old_nn])) {
             needs_rescan.push_back(idx);
         }
     }
 
-    // Clean up (resets both 1 and 2 to 0).
-    for (const auto& m : merges) {
-        is_changed_ws[m.first] = 0;
-        is_dead_ws[m.second] = 0;
+    if (needs_rescan.empty()) {
+        // Clean up (resets both 1 and 2 to 0).
+        for (const auto& m : merges) {
+            is_changed_ws[m.first] = 0;
+            is_dead_ws[m.second] = 0;
+        }
+        return;
     }
-
-    if (needs_rescan.empty()) return;
 
     auto rescan_range = [&](size_t start, size_t end) {
         for (size_t i = start; i < end; i++) {
-            clusters[needs_rescan[i]].update_nn(dist, max_merge_distance);
+            const int cid = clusters[needs_rescan[i]].id;
+            double best_val = std::numeric_limits<double>::infinity();
+            int best_idx = -1;
+
+            // k < cid: scattered upper-triangle entries
+            for (int k = 0; k < cid; ++k) {
+                if (!clusters[k].active || is_dead_ws[k]) continue;
+                const double v = static_cast<double>(dist.data[dist.tri_idx(k, cid)]);
+                if (v < best_val) {
+                    best_val = v;
+                    best_idx = k;
+                }
+            }
+
+            // k > cid: contiguous tail
+            if (cid + 1 < N) {
+                const size_t base = dist.tri_idx(cid, cid + 1);
+                const SymDistScalar* tail = dist.data.data() + base;
+                for (int k = cid + 1; k < N; ++k) {
+                    if (!clusters[k].active || is_dead_ws[k]) continue;
+                    const double v = static_cast<double>(tail[k - cid - 1]);
+                    if (v < best_val) {
+                        best_val = v;
+                        best_idx = k;
+                    }
+                }
+            }
+
+            clusters[needs_rescan[i]].nn = (best_val < max_merge_distance) ? best_idx : -1;
         }
     };
 
@@ -1311,6 +1339,12 @@ void update_cluster_nn_dist(
             start = end;
         }
         for (auto& th : threads) th.join();
+    }
+
+    // Clean up (resets both 1 and 2 to 0).
+    for (const auto& m : merges) {
+        is_changed_ws[m.first] = 0;
+        is_dead_ws[m.second] = 0;
     }
 }
 
