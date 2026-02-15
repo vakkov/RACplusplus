@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(racplusplus VERSION "0.0.5")
 message(STATUS "CC: $ENV{CC}")
 message(STATUS "CXX: $ENV{CXX}")
-option(RACPP_SYMDIST_USE_FLOAT "Store SymDistMatrix values as float32 instead of float64" OFF)
+option(RACPP_SYMDIST_USE_FLOAT "Store SymDistMatrix values as float32 instead of float64" ON)
 
 # Set the OpenMP flags here
 if(DEFINED ENV{OpenMP_LIBRARY})

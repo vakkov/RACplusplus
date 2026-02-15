@@ -238,13 +238,13 @@ Eigen::MatrixXd pairwise_euclidean(const Eigen::MatrixXd& array_a, const Eigen::
     return D.array().sqrt();
 }
 
-//Averaged dissimilarity across two matrices (wrapper for pairwise distance calc + avging)
-// Fix #4: take by const reference instead of by value
-double calculate_weighted_dissimilarity(const Eigen::MatrixXd& points_a, const Eigen::MatrixXd& points_b) {
-    Eigen::MatrixXd dissimilarity_matrix = pairwise_cosine(points_a, points_b);
+// //Averaged dissimilarity across two matrices (wrapper for pairwise distance calc + avging)
+// // Fix #4: take by const reference instead of by value
+// double calculate_weighted_dissimilarity(const Eigen::MatrixXd& points_a, const Eigen::MatrixXd& points_b) {
+//     Eigen::MatrixXd dissimilarity_matrix = pairwise_cosine(points_a, points_b);
 
-    return static_cast<double>(dissimilarity_matrix.mean());
-}
+//     return static_cast<double>(dissimilarity_matrix.mean());
+// }
 
 // Fix #4: take clusters by const reference instead of by value
 std::vector<std::pair<int, std::vector<std::pair<int, double>>>> consolidate_indices(
@@ -637,11 +637,26 @@ double get_cluster_distances(
     if (it != main_cluster.dissimilarities.end() && it->first == other_cluster_id) {
         return it->second;
     } else {
-        Eigen::MatrixXd full_main = base_arr(Eigen::all, main_cluster.indices);
-        Eigen::MatrixXd full_other = base_arr(Eigen::all, other_cluster_idxs);
-        double dist = pairwise_cosine(full_main, full_other).mean();
+        const size_t size_main = main_cluster.indices.size();
+        const size_t size_other = other_cluster_idxs.size();
+        if (size_main == 0 || size_other == 0) {
+            return std::numeric_limits<double>::infinity();
+        }
 
-        return dist;
+        // mean(1 - dot(a, b)) over all a in A, b in B:
+        // 1 - (sum_A · sum_B) / (|A| * |B|)
+        Eigen::VectorXd sum_main = Eigen::VectorXd::Zero(base_arr.rows());
+        Eigen::VectorXd sum_other = Eigen::VectorXd::Zero(base_arr.rows());
+
+        for (int idx : main_cluster.indices) {
+            sum_main.noalias() += base_arr.col(idx);
+        }
+        for (int idx : other_cluster_idxs) {
+            sum_other.noalias() += base_arr.col(idx);
+        }
+
+        const double mean_dot = sum_main.dot(sum_other) / static_cast<double>(size_main * size_other);
+        return 1.0 - mean_dot;
     }
 }
 
@@ -1413,19 +1428,22 @@ std::vector<int> RAC(
 #if !RACPP_BUILDING_LIB_ONLY
 //Wrapper for RAC, convert return vector to a numpy array
 py::array RAC_py(
-    py::array_t<double, py::array::c_style> base_arr_np,
+    py::array base_arr_np,
     double max_merge_distance,
     py::object connectivity = py::none(),
     int batch_size = 0,
     int no_processors = 0,
-    std::string distance_metric = "euclidean") {
+    std::string distance_metric = "cosine") {
 
     auto buf = base_arr_np.request();
     if (buf.ndim != 2) {
-        throw py::value_error("base_arr must be a 2D numpy.ndarray with shape (N, D) and dtype float64.");
+        throw py::value_error("base_arr must be a 2D numpy.ndarray with shape (N, D)");
     }
     if (buf.shape[0] <= 0 || buf.shape[1] <= 0) {
         throw py::value_error("base_arr must have positive shape (N > 0, D > 0).");
+    }
+    if ((base_arr_np.flags() & py::array::c_style) == 0) {
+        throw py::value_error("base_arr must be C-contiguous. Use np.ascontiguousarray(base_arr).");
     }
     if (batch_size < 0) {
         throw py::value_error("batch_size must be >= 0.");
@@ -1440,16 +1458,36 @@ py::array RAC_py(
     const int N = static_cast<int>(buf.shape[0]);
     const int D = static_cast<int>(buf.shape[1]);
 
-    // Zero-copy transpose: C-contiguous (N,D) numpy == column-major (D,N) Eigen.
-    Eigen::Map<const Eigen::MatrixXd> base_transposed(
-        static_cast<const double*>(buf.ptr), D, N);
+    const std::string format = buf.format;
+    const bool is_float64 = (format == py::format_descriptor<double>::format());
+    const bool is_float32 = (format == py::format_descriptor<float>::format());
+    if (!is_float64 && !is_float32) {
+        throw py::value_error("base_arr dtype must be float32 or float64.");
+    }
 
-    // One allocation: D×N working copy (normalized if cosine).
+    // One allocation: DxN working copy (normalized if cosine).
     Eigen::MatrixXd base_arr;
-    if (distance_metric == "cosine") {
-        base_arr = base_transposed.colwise().normalized();
+
+    if (is_float64) {
+        // Zero-copy transpose: C-contiguous (N,D) numpy == column-major (D,N) Eigen.
+        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
+            static_cast<const double*>(buf.ptr), D, N);
+
+        if (distance_metric == "cosine") {
+            base_arr = base_transposed.colwise().normalized();
+        } else {
+            base_arr = base_transposed;
+        }
     } else {
-        base_arr = base_transposed;
+        // Float32 input path: cast to double working matrix once.
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
+            static_cast<const float*>(buf.ptr), D, N);
+
+        if (distance_metric == "cosine") {
+            base_arr = base_transposed.cast<double>().colwise().normalized();
+        } else {
+            base_arr = base_transposed.cast<double>();
+        }
     }
 
     std::shared_ptr<Eigen::SparseMatrix<bool>> sparse_connectivity = nullptr;
@@ -1514,7 +1552,7 @@ PYBIND11_MODULE(_racplusplus, m){
     )doc";
 
     m.def("rac", &RAC_py,
-        py::arg("base_arr").noconvert(),
+        py::arg("base_arr"),
         py::arg("max_merge_distance"),
         py::arg("connectivity") = py::none(),
         py::arg("batch_size") = 0,

@@ -195,8 +195,8 @@ Eigen::MatrixXd pairwise_cosine(const Eigen::MatrixXd& A, const Eigen::MatrixXd&
 //Calculate pairwise euclidean between two matrices
 Eigen::MatrixXd pairwise_euclidean(const Eigen::MatrixXd& array_a, const Eigen::MatrixXd& array_b);
 
-//Averaged dissimilarity across two matrices (wrapper for pairwise distance calc + avging)
-double calculate_weighted_dissimilarity(const Eigen::MatrixXd& points_a, const Eigen::MatrixXd& points_b);
+// //Averaged dissimilarity across two matrices (wrapper for pairwise distance calc + avging)
+// double calculate_weighted_dissimilarity(const Eigen::MatrixXd& points_a, const Eigen::MatrixXd& points_b);
 
 void update_cluster_dissimilarities(
     std::vector<std::pair<int, int> >& merges,
@@ -350,7 +350,7 @@ std::vector<int> RAC(
 
 #if !RACPP_BUILDING_LIB_ONLY
 py::array RAC_py(
-    py::array_t<double, py::array::c_style> base_arr_np,
+    py::array base_arr_np,
     double max_merge_distance,
     py::object connectivity,
     int batch_size,
