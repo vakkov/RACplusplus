@@ -3,6 +3,8 @@ project(racplusplus VERSION "0.0.5")
 message(STATUS "CC: $ENV{CC}")
 message(STATUS "CXX: $ENV{CXX}")
 option(RACPP_SYMDIST_USE_FLOAT "Store SymDistMatrix values as float32 instead of float64" ON)
+option(RACPP_ENABLE_MARCH_NATIVE "Enable -march=native for host-specific CPU optimizations" ON)
+option(RACPP_ENABLE_FAST_MATH "Enable -ffast-math (may change floating-point numerics)" ON)
 
 # Set the OpenMP flags here
 if(DEFINED ENV{OpenMP_LIBRARY})
@@ -50,6 +52,14 @@ if (MSVC)
 else()
 
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wsign-compare -Wunreachable-code -fwrapv -Wall")
+  if (RACPP_ENABLE_MARCH_NATIVE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+    message(STATUS "Extra optimization: -march=native enabled")
+  endif()
+  if (RACPP_ENABLE_FAST_MATH)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffast-math")
+    message(STATUS "Extra optimization: -ffast-math enabled")
+  endif()
   set(CMAKE_CXX_STANDARD 17)
 endif()
 

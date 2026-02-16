@@ -26,6 +26,10 @@ python3 -m pip wheel . -w dist
 ```
 rm -rf _skbuild && python3 -m pip install /home/gpu/racplusplus --config-settings=cmake.args=-DRACPP_SYMDIST_USE_FLOAT=ON
 ```
+OR
+```
+CMAKE_ARGS="-DRACPP_SYMDIST_USE_FLOAT=ON -DRACPP_ENABLE_MARCH_NATIVE=ON -DRACPP_ENABLE_FAST_MATH=ON" python3 -m pip install /home/gpu/racplusplus --no-cache-dir --no-build-isolation -v
+```
 
 ## Contributors
 
