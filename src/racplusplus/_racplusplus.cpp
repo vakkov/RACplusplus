@@ -284,12 +284,14 @@ Cluster::Cluster(int id)
     : id(id), will_merge(false), active(true) {
         indices.push_back(id);
         this->nn = -1;
+        this->nn_distance = std::numeric_limits<double>::infinity();
     }
 
 
 void Cluster::update_nn(double max_merge_distance) {
     if (neighbor_distances.size() == 0) {
         nn = -1;
+        nn_distance = std::numeric_limits<double>::infinity();
         return;
     }
 
@@ -304,6 +306,7 @@ void Cluster::update_nn(double max_merge_distance) {
         }
     }
 
+    nn_distance = min;
     if (min < max_merge_distance) {
         this->nn = nn;
     } else {
@@ -313,6 +316,7 @@ void Cluster::update_nn(double max_merge_distance) {
 
 void Cluster::update_nn(const SymDistMatrix& dist, double max_merge_distance) {
     auto [min_val, min_idx] = dist.min_in_col(this->id);
+    nn_distance = min_val;
 
     if (min_val < max_merge_distance) {
         this->nn = min_idx;
@@ -652,8 +656,8 @@ void update_cluster_dissimilarities(
         // Parallel column computation (unchanged).
         auto compute_range = [&](size_t start, size_t end) {
             const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
-            SymDistVector main_col(N);
-            SymDistVector sec_col(N);
+            const size_t* row_start = dist.row_start.data();
+            const SymDistScalar* dist_data = dist.data.data();
 
             for (size_t i = start; i < end; i++) {
                 const int main_id = merge_main_ids[i];
@@ -662,20 +666,67 @@ void update_cluster_dissimilarities(
                     static_cast<SymDistScalar>(merge_main_sizes[i] * merge_inv_sizes[i]);
                 const SymDistScalar secondary_weight =
                     static_cast<SymDistScalar>(merge_secondary_sizes[i] * merge_inv_sizes[i]);
+                SymDistVector& out_col = merged_columns[i];
 
-                dist.get_col_into(main_id, main_col);
-                dist.get_col_into(secondary_id, sec_col);
-                merged_columns[i].noalias() = main_weight * main_col + secondary_weight * sec_col;
+                const size_t main_base = row_start[static_cast<size_t>(main_id)];
+                const size_t sec_base = row_start[static_cast<size_t>(secondary_id)];
+                const int lo_id = std::min(main_id, secondary_id);
+                const int hi_id = std::max(main_id, secondary_id);
+                const bool main_is_lo = (main_id == lo_id);
+
+                // k < lo_id: both terms are from scattered upper-triangle entries.
+                for (int k = 0; k < lo_id; ++k) {
+                    const size_t row_base = row_start[static_cast<size_t>(k)];
+                    const SymDistScalar d_main =
+                        dist_data[row_base + static_cast<size_t>(main_id - k - 1)];
+                    const SymDistScalar d_sec =
+                        dist_data[row_base + static_cast<size_t>(secondary_id - k - 1)];
+                    out_col[k] = main_weight * d_main + secondary_weight * d_sec;
+                }
+
+                out_col[lo_id] = inf;
+
+                // lo_id < k < hi_id: one term contiguous (for lo_id), one scattered (for hi_id).
+                if (main_is_lo) {
+                    for (int k = lo_id + 1; k < hi_id; ++k) {
+                        const SymDistScalar d_main =
+                            dist_data[main_base + static_cast<size_t>(k - main_id - 1)];
+                        const SymDistScalar d_sec =
+                            dist_data[row_start[static_cast<size_t>(k)] +
+                                      static_cast<size_t>(secondary_id - k - 1)];
+                        out_col[k] = main_weight * d_main + secondary_weight * d_sec;
+                    }
+                } else {
+                    for (int k = lo_id + 1; k < hi_id; ++k) {
+                        const SymDistScalar d_main =
+                            dist_data[row_start[static_cast<size_t>(k)] +
+                                      static_cast<size_t>(main_id - k - 1)];
+                        const SymDistScalar d_sec =
+                            dist_data[sec_base + static_cast<size_t>(k - secondary_id - 1)];
+                        out_col[k] = main_weight * d_main + secondary_weight * d_sec;
+                    }
+                }
+
+                out_col[hi_id] = inf;
+
+                // k > hi_id: both terms are from contiguous tails.
+                for (int k = hi_id + 1; k < N; ++k) {
+                    const SymDistScalar d_main =
+                        dist_data[main_base + static_cast<size_t>(k - main_id - 1)];
+                    const SymDistScalar d_sec =
+                        dist_data[sec_base + static_cast<size_t>(k - secondary_id - 1)];
+                    out_col[k] = main_weight * d_main + secondary_weight * d_sec;
+                }
 
                 for (size_t j = 0; j < batch_size; j++) {
                     if (j == i) continue;
                     const SymDistScalar patched = cross_dist[i * batch_size + j];
-                    merged_columns[i][merge_main_ids[j]] = patched;
-                    merged_columns[i][merge_secondary_ids[j]] = patched;
+                    out_col[merge_main_ids[j]] = patched;
+                    out_col[merge_secondary_ids[j]] = patched;
                 }
 
-                merged_columns[i][main_id] = inf;
-                merged_columns[i][secondary_id] = inf;
+                out_col[main_id] = inf;
+                out_col[secondary_id] = inf;
             }
         };
 
@@ -701,23 +752,33 @@ void update_cluster_dissimilarities(
         if (is_last_batch) {
             const char* alive = is_alive_ws.data();
             const char* iter_secondary = is_iter_secondary.data();
+            std::vector<int> nn_candidates;
+            nn_candidates.reserve(static_cast<size_t>(N));
+            for (int k = 0; k < N; ++k) {
+                if (alive[k] && !iter_secondary[k]) {
+                    nn_candidates.push_back(k);
+                }
+            }
+            const int* cand_data = nn_candidates.data();
+            const size_t cand_count = nn_candidates.size();
+
             for (size_t i = 0; i < batch_size; i++) {
                 const int main_id = merge_main_ids[i];
                 const SymDistScalar* col_data = merged_columns[i].data();
                 SymDistScalar best_val = std::numeric_limits<SymDistScalar>::infinity();
                 int best_idx = -1;
 
-                for (int k = 0; k < N; k++) {
-                    if (!alive[k]) continue;
-                    if (iter_secondary[k]) continue;
+                for (size_t c = 0; c < cand_count; ++c) {
+                    const int k = cand_data[c];
                     if (col_data[k] < best_val) {
                         best_val = col_data[k];
                         best_idx = k;
                     }
                 }
 
-                clusters[main_id].nn =
-                    (static_cast<double>(best_val) < max_merge_distance) ? best_idx : -1;
+                const double best_val_d = static_cast<double>(best_val);
+                clusters[main_id].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
+                clusters[main_id].nn_distance = best_val_d;
             }
         }
     }
@@ -895,6 +956,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
 
     for (int k = 0; k < N; k++) {
         clusters[k].nn = (nn_best[k] < max_merge_distance) ? nn_idx[k] : -1;
+        clusters[k].nn_distance = nn_best[k];
     }
 
     return dist;
@@ -964,6 +1026,7 @@ void calculate_initial_dissimilarities(
 
         cluster.neighbor_distances = std::move(neighbors);
         cluster.nn = nearest_neighbor;
+        cluster.nn_distance = min;
     };
 
     for (int batchStart = 0; batchStart < clustersSize; batchStart += batch_size) {
@@ -1528,6 +1591,15 @@ void update_cluster_nn_dist(
         is_changed_ws[merges[i].first] = 2;
     }
 
+    std::vector<int> changed_main_ids;
+    changed_main_ids.reserve(merges.size());
+    for (const auto& m : merges) {
+        changed_main_ids.push_back(m.first);
+    }
+    constexpr size_t MAX_CHANGED_MAIN_SHORTLIST = 2048;
+    const bool use_changed_shortlist =
+        (changed_main_ids.size() <= MAX_CHANGED_MAIN_SHORTLIST);
+
     std::vector<int> needs_rescan;
     needs_rescan.reserve(active_indices.size());
     for (int idx : active_indices) {
@@ -1560,36 +1632,82 @@ void update_cluster_nn_dist(
     auto rescan_range = [&](size_t start, size_t end) {
         const char* alive = is_alive_ws.data();
         const char* dead = is_dead_ws.data();
+        const size_t* row_start = dist.row_start.data();
+        const SymDistScalar* dist_data = dist.data.data();
         for (size_t i = start; i < end; i++) {
-            const int cid = clusters[needs_rescan[i]].id;
+            const int cluster_idx = needs_rescan[i];
+            const int cid = clusters[cluster_idx].id;
             double best_val = std::numeric_limits<double>::infinity();
             int best_idx = -1;
+            bool used_shortcut = false;
 
-            // k < cid: scattered upper-triangle entries
-            for (int k = 0; k < cid; ++k) {
-                if (!alive[k] || dead[k]) continue;
-                const double v = static_cast<double>(dist.data[dist.tri_idx(k, cid)]);
-                if (v < best_val) {
-                    best_val = v;
-                    best_idx = k;
+            const int old_nn = clusters[cluster_idx].nn;
+            const double old_nn_dist = clusters[cluster_idx].nn_distance;
+            if (use_changed_shortlist &&
+                old_nn != -1 &&
+                is_changed_ws[old_nn] &&
+                alive[old_nn] &&
+                !dead[old_nn] &&
+                old_nn_dist < std::numeric_limits<double>::infinity()) {
+
+                double changed_best = std::numeric_limits<double>::infinity();
+                int changed_best_idx = -1;
+                const size_t cid_base = row_start[static_cast<size_t>(cid)];
+
+                for (int k : changed_main_ids) {
+                    if (k == cid || !alive[k] || dead[k]) continue;
+                    const double v = (k < cid)
+                        ? static_cast<double>(
+                            dist_data[row_start[static_cast<size_t>(k)] +
+                                      static_cast<size_t>(cid - k - 1)])
+                        : static_cast<double>(
+                            dist_data[cid_base + static_cast<size_t>(k - cid - 1)]);
+                    if (v < changed_best ||
+                        (v == changed_best && (changed_best_idx == -1 || k < changed_best_idx))) {
+                        changed_best = v;
+                        changed_best_idx = k;
+                    }
+                }
+
+                // Safe skip of full scan: changed set produced a strictly better NN than
+                // previous best distance. Unchanged distances did not change in this round.
+                if (changed_best < old_nn_dist) {
+                    best_val = changed_best;
+                    best_idx = changed_best_idx;
+                    used_shortcut = true;
                 }
             }
 
-            // k > cid: contiguous tail
-            if (cid + 1 < N) {
-                const size_t base = dist.tri_idx(cid, cid + 1);
-                const SymDistScalar* tail = dist.data.data() + base;
-                for (int k = cid + 1; k < N; ++k) {
+            if (!used_shortcut) {
+                // k < cid: scattered upper-triangle entries
+                for (int k = 0; k < cid; ++k) {
                     if (!alive[k] || dead[k]) continue;
-                    const double v = static_cast<double>(tail[k - cid - 1]);
+                    const double v = static_cast<double>(
+                        dist_data[row_start[static_cast<size_t>(k)] +
+                                  static_cast<size_t>(cid - k - 1)]);
                     if (v < best_val) {
                         best_val = v;
                         best_idx = k;
                     }
                 }
+
+                // k > cid: contiguous tail
+                if (cid + 1 < N) {
+                    const size_t base = row_start[static_cast<size_t>(cid)];
+                    const SymDistScalar* tail = dist_data + base;
+                    for (int k = cid + 1; k < N; ++k) {
+                        if (!alive[k] || dead[k]) continue;
+                        const double v = static_cast<double>(tail[k - cid - 1]);
+                        if (v < best_val) {
+                            best_val = v;
+                            best_idx = k;
+                        }
+                    }
+                }
             }
 
-            clusters[needs_rescan[i]].nn = (best_val < max_merge_distance) ? best_idx : -1;
+            clusters[cluster_idx].nn = (best_val < max_merge_distance) ? best_idx : -1;
+            clusters[cluster_idx].nn_distance = best_val;
         }
     };
 
@@ -1865,9 +1983,10 @@ void RAC_i(
             for (int i = 0; i < A; i++) {
                 new_clusters.emplace_back(i);
                 Cluster& oc = clusters[compact_to_orig[i]];
-                new_clusters[i].nn =
-                    (oc.nn >= 0 && orig_to_compact[oc.nn] >= 0)
-                        ? orig_to_compact[oc.nn] : -1;
+                const bool has_mapped_nn = (oc.nn >= 0 && orig_to_compact[oc.nn] >= 0);
+                new_clusters[i].nn = has_mapped_nn ? orig_to_compact[oc.nn] : -1;
+                new_clusters[i].nn_distance =
+                    has_mapped_nn ? oc.nn_distance : std::numeric_limits<double>::infinity();
             }
             clusters = std::move(new_clusters);
 

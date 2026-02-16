@@ -40,6 +40,7 @@ public:
     bool will_merge;
     bool active;
     int nn;
+    double nn_distance;
     std::vector<std::pair<int, double>> neighbor_distances;
     std::vector<int> neighbors;
     std::vector<int> indices;
