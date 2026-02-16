@@ -31,6 +31,9 @@ namespace py = pybind11;
 #include <random>
 #include <numeric>
 #include <cmath>
+#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE
+#include <immintrin.h>
+#endif
 
 #include "_racplusplus.h"
 
@@ -686,6 +689,29 @@ void update_cluster_dissimilarities(
 
         const int* write_cand_data = write_candidates.data();
         const size_t write_cand_count = write_candidates.size();
+        struct CandidateRun {
+            int k_start;
+            int k_end;
+            size_t len;
+        };
+        std::vector<CandidateRun> write_candidate_runs;
+        write_candidate_runs.reserve(write_cand_count > 0 ? write_cand_count / 4 : 0);
+        if (write_cand_count > 0) {
+            size_t run_start = 0;
+            for (size_t c = 1; c <= write_cand_count; ++c) {
+                const bool is_break =
+                    (c == write_cand_count) ||
+                    (write_cand_data[c] != write_cand_data[c - 1] + 1);
+                if (!is_break) continue;
+                const int k0 = write_cand_data[run_start];
+                const int k1 = write_cand_data[c - 1];
+                write_candidate_runs.push_back(
+                    CandidateRun{k0, k1, c - run_start});
+                run_start = c;
+            }
+        }
+        const CandidateRun* run_data = write_candidate_runs.data();
+        const size_t run_count = write_candidate_runs.size();
 
         // Parallel column computation over live candidates only.
         auto compute_range = [&](size_t start, size_t end) {
@@ -704,7 +730,14 @@ void update_cluster_dissimilarities(
 
                 const size_t main_base = row_start[static_cast<size_t>(main_id)];
                 const size_t sec_base = row_start[static_cast<size_t>(secondary_id)];
-                for (size_t c = 0; c < write_cand_count; ++c) {
+                const int cutoff_id = std::max(main_id, secondary_id);
+                const int* tail_begin = std::upper_bound(
+                    write_cand_data, write_cand_data + write_cand_count, cutoff_id);
+                const size_t tail_start =
+                    static_cast<size_t>(tail_begin - write_cand_data);
+
+                // Head region: at least one source is scattered in triangular storage.
+                for (size_t c = 0; c < tail_start; ++c) {
                     const int k = write_cand_data[c];
                     if (k == main_id || k == secondary_id) {
                         out_col[k] = inf;
@@ -722,6 +755,62 @@ void update_cluster_dissimilarities(
                         : dist_data[sec_base +
                                     static_cast<size_t>(k - secondary_id - 1)];
                     out_col[k] = main_weight * d_main + secondary_weight * d_sec;
+                }
+
+                // Tail region: k > max(main_id, secondary_id).
+                // For contiguous candidate runs, both source rows and destination are contiguous.
+                // Runs are precomputed once per sub-batch to avoid per-merge run detection cost.
+                size_t run_idx = 0;
+                size_t lo = 0, hi = run_count;
+                while (lo < hi) {
+                    const size_t mid = lo + (hi - lo) / 2;
+                    if (run_data[mid].k_end <= cutoff_id) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                run_idx = lo;
+                while (run_idx < run_count) {
+                    const CandidateRun& run = run_data[run_idx];
+                    size_t run_off = 0;
+                    if (cutoff_id >= run.k_start) {
+                        run_off = static_cast<size_t>(cutoff_id - run.k_start + 1);
+                        if (run_off >= run.len) {
+                            ++run_idx;
+                            continue;
+                        }
+                    }
+                    const int k0 = run.k_start + static_cast<int>(run_off);
+                    const size_t run_len = run.len - run_off;
+                    const SymDistScalar* main_ptr =
+                        dist_data + main_base + static_cast<size_t>(k0 - main_id - 1);
+                    const SymDistScalar* sec_ptr =
+                        dist_data + sec_base + static_cast<size_t>(k0 - secondary_id - 1);
+                    SymDistScalar* out_ptr = out_col.data() + static_cast<size_t>(k0);
+
+#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE && \
+    defined(__AVX2__) && defined(__FMA__) && \
+    defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+                    size_t off = 0;
+                    const __m256 mw_vec = _mm256_set1_ps(main_weight);
+                    const __m256 sw_vec = _mm256_set1_ps(secondary_weight);
+                    for (; off + 7 < run_len; off += 8) {
+                        const __m256 dm = _mm256_loadu_ps(main_ptr + off);
+                        const __m256 ds = _mm256_loadu_ps(sec_ptr + off);
+                        const __m256 out =
+                            _mm256_fmadd_ps(mw_vec, dm, _mm256_mul_ps(sw_vec, ds));
+                        _mm256_storeu_ps(out_ptr + off, out);
+                    }
+                    for (; off < run_len; ++off) {
+                        out_ptr[off] = main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
+                    }
+#else
+                    for (size_t off = 0; off < run_len; ++off) {
+                        out_ptr[off] = main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
+                    }
+#endif
+                    ++run_idx;
                 }
 
                 for (size_t j = 0; j < i; ++j) {

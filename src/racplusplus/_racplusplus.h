@@ -151,19 +151,51 @@ public:
         int col_id,
         const Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& col,
         const std::vector<int>& active_ids) {
-        for (int k : active_ids) {
-            if (k == col_id) continue;
-            if (k < col_id) {
-                const size_t idx =
-                    row_start[static_cast<size_t>(k)] +
-                    static_cast<size_t>(col_id - k - 1);
-                data[idx] = static_cast<SymDistScalar>(col[k]);
-            } else {
-                const size_t idx =
-                    row_start[static_cast<size_t>(col_id)] +
-                    static_cast<size_t>(k - col_id - 1);
-                data[idx] = static_cast<SymDistScalar>(col[k]);
+        const int* ids = active_ids.data();
+        const size_t count = active_ids.size();
+
+        size_t split = 0;
+        while (split < count && ids[split] < col_id) {
+            ++split;
+        }
+
+        // k < col_id: scattered writes.
+        for (size_t p = 0; p < split; ++p) {
+            const int k = ids[p];
+            const size_t idx =
+                row_start[static_cast<size_t>(k)] +
+                static_cast<size_t>(col_id - k - 1);
+            data[idx] = static_cast<SymDistScalar>(col[k]);
+        }
+
+        // Skip self entry if present.
+        size_t p = split;
+        if (p < count && ids[p] == col_id) {
+            ++p;
+        }
+
+        // k > col_id: write contiguous id runs with contiguous source/destination.
+        const size_t col_base = row_start[static_cast<size_t>(col_id)];
+        while (p < count) {
+            const int k0 = ids[p];
+            size_t run_end = p + 1;
+            while (run_end < count && ids[run_end] == ids[run_end - 1] + 1) {
+                ++run_end;
             }
+
+            const size_t run_len = run_end - p;
+            SymDistScalar* dst =
+                data.data() + col_base + static_cast<size_t>(k0 - col_id - 1);
+            const Scalar* src = col.data() + static_cast<size_t>(k0);
+
+            if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
+                std::copy_n(src, run_len, dst);
+            } else {
+                for (size_t off = 0; off < run_len; ++off) {
+                    dst[off] = static_cast<SymDistScalar>(src[off]);
+                }
+            }
+            p = run_end;
         }
     }
 
