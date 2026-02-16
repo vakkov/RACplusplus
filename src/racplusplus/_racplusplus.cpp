@@ -1643,11 +1643,11 @@ void update_cluster_nn_dist(
 
             const int old_nn = clusters[cluster_idx].nn;
             const double old_nn_dist = clusters[cluster_idx].nn_distance;
+            const bool nn_invalidated =
+                (old_nn != -1) &&
+                (dead[old_nn] || is_changed_ws[old_nn]);
             if (use_changed_shortlist &&
-                old_nn != -1 &&
-                is_changed_ws[old_nn] &&
-                alive[old_nn] &&
-                !dead[old_nn] &&
+                nn_invalidated &&
                 old_nn_dist < std::numeric_limits<double>::infinity()) {
 
                 double changed_best = std::numeric_limits<double>::infinity();
