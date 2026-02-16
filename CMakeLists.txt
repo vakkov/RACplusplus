@@ -5,6 +5,7 @@ message(STATUS "CXX: $ENV{CXX}")
 option(RACPP_SYMDIST_USE_FLOAT "Store SymDistMatrix values as float32 instead of float64" ON)
 option(RACPP_ENABLE_MARCH_NATIVE "Enable -march=native for host-specific CPU optimizations" ON)
 option(RACPP_ENABLE_FAST_MATH "Enable -ffast-math (may change floating-point numerics)" ON)
+option(RACPP_USE_BLAS_BACKEND "Use external BLAS backend for Eigen GEMM (OpenBLAS/MKL/BLIS)" OFF)
 
 # Set the OpenMP flags here
 if(DEFINED ENV{OpenMP_LIBRARY})
@@ -68,6 +69,9 @@ find_package(Python3 REQUIRED Development.Module)
 find_package(Python3 REQUIRED Interpreter)
 find_package(pybind11 REQUIRED)
 find_package(Eigen3 REQUIRED)
+if (RACPP_USE_BLAS_BACKEND)
+  find_package(BLAS REQUIRED)
+endif()
 #-------------------------------------------------------------
 
 #-------------------------------------Include Directories----------------------------
@@ -91,6 +95,18 @@ if (RACPP_SYMDIST_USE_FLOAT)
 else()
   target_compile_definitions(${python_module_name} PRIVATE RACPP_SYMDIST_USE_FLOAT=0)
   message(STATUS "SymDistMatrix storage precision: float64")
+endif()
+
+if (RACPP_USE_BLAS_BACKEND)
+  target_compile_definitions(${python_module_name} PRIVATE EIGEN_USE_BLAS=1)
+  if (TARGET BLAS::BLAS)
+    target_link_libraries(${python_module_name} PRIVATE BLAS::BLAS)
+  else()
+    target_link_libraries(${python_module_name} PRIVATE ${BLAS_LIBRARIES})
+  endif()
+  message(STATUS "Eigen GEMM backend: external BLAS")
+else()
+  message(STATUS "Eigen GEMM backend: Eigen built-in")
 endif()
 
 #-----------------------------------Link Libraries-------------------------------------
