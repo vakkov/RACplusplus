@@ -590,6 +590,24 @@ void update_cluster_dissimilarities(
         is_iter_secondary[merge.second] = 1;
     }
 
+    // Alive ids needed for distance compute/write-back this iteration.
+    // Must include secondaries: future sub-batches still read their distances
+    // until those merges are processed.
+    std::vector<int> write_candidates;
+    write_candidates.reserve(static_cast<size_t>(N));
+    // NN refresh candidates (exclude iteration secondaries).
+    std::vector<int> nn_candidates;
+    nn_candidates.reserve(static_cast<size_t>(N));
+    for (int k = 0; k < N; ++k) {
+        if (!is_alive_ws[k]) continue;
+        write_candidates.push_back(k);
+        if (!is_iter_secondary[k]) {
+            nn_candidates.push_back(k);
+        }
+    }
+    const int* write_cand_data = write_candidates.data();
+    const size_t write_cand_count = write_candidates.size();
+
     // Reuse per-batch metadata buffers across sub-batches.
     std::vector<int> merge_main_ids(max_batch);
     std::vector<int> merge_secondary_ids(max_batch);
@@ -597,8 +615,9 @@ void update_cluster_dissimilarities(
     std::vector<double> merge_secondary_sizes(max_batch);
     std::vector<double> merge_inv_sizes(max_batch);
     std::vector<SymDistScalar> cross_dist(
-        max_batch * max_batch,
+        std::max<size_t>(1, max_batch * (max_batch - 1) / 2),
         std::numeric_limits<SymDistScalar>::infinity());
+    std::vector<size_t> cross_row_start(max_batch, 0);
 
     for (size_t batch_start = 0; batch_start < merge_count; batch_start += MERGE_BATCH) {
         const size_t batch_end = std::min(batch_start + MERGE_BATCH, merge_count);
@@ -613,11 +632,11 @@ void update_cluster_dissimilarities(
             merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
         }
 
-        // Precompute intra-batch merged-to-merged distances once.
-        // This avoids repeated random dist.get() calls in the per-column loop.
-        const size_t cross_count = batch_size * batch_size;
-        std::fill_n(cross_dist.data(), cross_count,
-                    std::numeric_limits<SymDistScalar>::infinity());
+        // Precompute triangular row bases for cross_dist(i,j), i<j.
+        for (size_t i = 0; i < batch_size; ++i) {
+            cross_row_start[i] =
+                i * batch_size - (i * (i + 1)) / 2;
+        }
 
         auto precompute_cross_range = [&](size_t start, size_t end) {
             for (size_t i = start; i < end; i++) {
@@ -640,8 +659,7 @@ void update_cluster_dissimilarities(
                     const double d_si_to_j = (sz_mj * d_si_mj + sz_sj * d_si_sj) * inv_j;
                     const double d_ij = (sz_mi * d_mi_to_j + sz_si * d_si_to_j) * inv_i;
                     const SymDistScalar val = static_cast<SymDistScalar>(d_ij);
-                    cross_dist[i * batch_size + j] = val;
-                    cross_dist[j * batch_size + i] = val;
+                    cross_dist[cross_row_start[i] + (j - i - 1)] = val;
                 }
             }
         };
@@ -653,7 +671,7 @@ void update_cluster_dissimilarities(
             run_parallel_for(requested_threads, batch_size, precompute_cross_range);
         }
 
-        // Parallel column computation (unchanged).
+        // Parallel column computation over live candidates only.
         auto compute_range = [&](size_t start, size_t end) {
             const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
             const size_t* row_start = dist.row_start.data();
@@ -670,59 +688,35 @@ void update_cluster_dissimilarities(
 
                 const size_t main_base = row_start[static_cast<size_t>(main_id)];
                 const size_t sec_base = row_start[static_cast<size_t>(secondary_id)];
-                const int lo_id = std::min(main_id, secondary_id);
-                const int hi_id = std::max(main_id, secondary_id);
-                const bool main_is_lo = (main_id == lo_id);
+                for (size_t c = 0; c < write_cand_count; ++c) {
+                    const int k = write_cand_data[c];
+                    if (k == main_id || k == secondary_id) {
+                        out_col[k] = inf;
+                        continue;
+                    }
 
-                // k < lo_id: both terms are from scattered upper-triangle entries.
-                for (int k = 0; k < lo_id; ++k) {
-                    const size_t row_base = row_start[static_cast<size_t>(k)];
-                    const SymDistScalar d_main =
-                        dist_data[row_base + static_cast<size_t>(main_id - k - 1)];
-                    const SymDistScalar d_sec =
-                        dist_data[row_base + static_cast<size_t>(secondary_id - k - 1)];
+                    const SymDistScalar d_main = (k < main_id)
+                        ? dist_data[row_start[static_cast<size_t>(k)] +
+                                    static_cast<size_t>(main_id - k - 1)]
+                        : dist_data[main_base +
+                                    static_cast<size_t>(k - main_id - 1)];
+                    const SymDistScalar d_sec = (k < secondary_id)
+                        ? dist_data[row_start[static_cast<size_t>(k)] +
+                                    static_cast<size_t>(secondary_id - k - 1)]
+                        : dist_data[sec_base +
+                                    static_cast<size_t>(k - secondary_id - 1)];
                     out_col[k] = main_weight * d_main + secondary_weight * d_sec;
                 }
 
-                out_col[lo_id] = inf;
-
-                // lo_id < k < hi_id: one term contiguous (for lo_id), one scattered (for hi_id).
-                if (main_is_lo) {
-                    for (int k = lo_id + 1; k < hi_id; ++k) {
-                        const SymDistScalar d_main =
-                            dist_data[main_base + static_cast<size_t>(k - main_id - 1)];
-                        const SymDistScalar d_sec =
-                            dist_data[row_start[static_cast<size_t>(k)] +
-                                      static_cast<size_t>(secondary_id - k - 1)];
-                        out_col[k] = main_weight * d_main + secondary_weight * d_sec;
-                    }
-                } else {
-                    for (int k = lo_id + 1; k < hi_id; ++k) {
-                        const SymDistScalar d_main =
-                            dist_data[row_start[static_cast<size_t>(k)] +
-                                      static_cast<size_t>(main_id - k - 1)];
-                        const SymDistScalar d_sec =
-                            dist_data[sec_base + static_cast<size_t>(k - secondary_id - 1)];
-                        out_col[k] = main_weight * d_main + secondary_weight * d_sec;
-                    }
-                }
-
-                out_col[hi_id] = inf;
-
-                // k > hi_id: both terms are from contiguous tails.
-                for (int k = hi_id + 1; k < N; ++k) {
-                    const SymDistScalar d_main =
-                        dist_data[main_base + static_cast<size_t>(k - main_id - 1)];
-                    const SymDistScalar d_sec =
-                        dist_data[sec_base + static_cast<size_t>(k - secondary_id - 1)];
-                    out_col[k] = main_weight * d_main + secondary_weight * d_sec;
-                }
-
-                for (size_t j = 0; j < batch_size; j++) {
-                    if (j == i) continue;
-                    const SymDistScalar patched = cross_dist[i * batch_size + j];
+                for (size_t j = 0; j < i; ++j) {
+                    const SymDistScalar patched =
+                        cross_dist[cross_row_start[j] + (i - j - 1)];
                     out_col[merge_main_ids[j]] = patched;
-                    out_col[merge_secondary_ids[j]] = patched;
+                }
+                for (size_t j = i + 1; j < batch_size; ++j) {
+                    const SymDistScalar patched =
+                        cross_dist[cross_row_start[i] + (j - i - 1)];
+                    out_col[merge_main_ids[j]] = patched;
                 }
 
                 out_col[main_id] = inf;
@@ -738,10 +732,9 @@ void update_cluster_dissimilarities(
         }
 
         // Serial write-back for merge mains.
-        // We no longer write full secondary columns to +inf here; NN scans
-        // explicitly skip inactive/dead ids to avoid O(batch_size * N) writes.
+        // Active-only write-back avoids touching dead ids.
         for (size_t i = 0; i < batch_size; i++) {
-            dist.set_col(merge_main_ids[i], merged_columns[i]);
+            dist.set_col_active(merge_main_ids[i], merged_columns[i], write_candidates);
             dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
         }
         // ITEM 6: Compute NN for merge mains from contiguous merged_columns,
@@ -750,15 +743,6 @@ void update_cluster_dissimilarities(
         // update_cluster_nn_dist instead.
         const bool is_last_batch = (batch_end >= merge_count);
         if (is_last_batch) {
-            const char* alive = is_alive_ws.data();
-            const char* iter_secondary = is_iter_secondary.data();
-            std::vector<int> nn_candidates;
-            nn_candidates.reserve(static_cast<size_t>(N));
-            for (int k = 0; k < N; ++k) {
-                if (alive[k] && !iter_secondary[k]) {
-                    nn_candidates.push_back(k);
-                }
-            }
             const int* cand_data = nn_candidates.data();
             const size_t cand_count = nn_candidates.size();
 

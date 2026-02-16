@@ -144,6 +144,29 @@ public:
         }
     }
 
+    // Write only entries whose counterpart id is in active_ids.
+    // This avoids touching dead/secondary rows in hot merge write-back paths.
+    template <typename Scalar>
+    void set_col_active(
+        int col_id,
+        const Eigen::Matrix<Scalar, Eigen::Dynamic, 1>& col,
+        const std::vector<int>& active_ids) {
+        for (int k : active_ids) {
+            if (k == col_id) continue;
+            if (k < col_id) {
+                const size_t idx =
+                    row_start[static_cast<size_t>(k)] +
+                    static_cast<size_t>(col_id - k - 1);
+                data[idx] = static_cast<SymDistScalar>(col[k]);
+            } else {
+                const size_t idx =
+                    row_start[static_cast<size_t>(col_id)] +
+                    static_cast<size_t>(k - col_id - 1);
+                data[idx] = static_cast<SymDistScalar>(col[k]);
+            }
+        }
+    }
+
     // Find minimum value in a "column" without allocating a VectorXd.
     // Returns (min_value, min_index).
     // Uses split-loop to avoid branch per element and exploit contiguous access for k > col_id.
