@@ -6,6 +6,7 @@ option(RACPP_SYMDIST_USE_FLOAT "Store SymDistMatrix values as float32 instead of
 option(RACPP_ENABLE_MARCH_NATIVE "Enable -march=native for host-specific CPU optimizations" ON)
 option(RACPP_ENABLE_FAST_MATH "Enable -ffast-math (may change floating-point numerics)" ON)
 option(RACPP_USE_BLAS_BACKEND "Use external BLAS backend for Eigen GEMM (OpenBLAS/MKL/BLIS)" OFF)
+option(RACPP_SPLIT_STORE_NN "Split dense-init off-diagonal store and NN update into two passes" OFF)
 
 # Set the OpenMP flags here
 if(DEFINED ENV{OpenMP_LIBRARY})
@@ -95,6 +96,13 @@ if (RACPP_SYMDIST_USE_FLOAT)
 else()
   target_compile_definitions(${python_module_name} PRIVATE RACPP_SYMDIST_USE_FLOAT=0)
   message(STATUS "SymDistMatrix storage precision: float64")
+endif()
+
+if (RACPP_SPLIT_STORE_NN)
+  target_compile_definitions(${python_module_name} PRIVATE RACPP_SPLIT_STORE_NN=1)
+  message(STATUS "Dense-init off-diagonal store/NN split: enabled")
+else()
+  message(STATUS "Dense-init off-diagonal store/NN split: disabled")
 endif()
 
 if (RACPP_USE_BLAS_BACKEND)

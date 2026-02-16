@@ -898,6 +898,20 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                         dist.row_start[static_cast<size_t>(i_global)] +
                         static_cast<size_t>(tp.j_start - i_global - 1);
                     if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
+#if defined(RACPP_SPLIT_STORE_NN) && RACPP_SPLIT_STORE_NN
+                        for (int c = 0; c < tile_j; c++) {
+                            const Scalar v =
+                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                            dist.data[base_idx + c] = v;
+                        }
+                        const SymDistScalar* written = dist.data.data() + base_idx;
+                        for (int c = 0; c < tile_j; c++) {
+                            const int j_global = tp.j_start + c;
+                            const double val = static_cast<double>(written[c]);
+                            update_local_nn(i_global, j_global, val);
+                            update_local_nn(j_global, i_global, val);
+                        }
+#else
                         for (int c = 0; c < tile_j; c++) {
                             const Scalar v =
                                 is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
@@ -907,7 +921,23 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                             update_local_nn(i_global, j_global, val);
                             update_local_nn(j_global, i_global, val);
                         }
+#endif
                     } else {
+#if defined(RACPP_SPLIT_STORE_NN) && RACPP_SPLIT_STORE_NN
+                        for (int c = 0; c < tile_j; c++) {
+                            const Scalar v =
+                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                            dist.data[base_idx + c] =
+                                static_cast<SymDistScalar>(v);
+                        }
+                        const SymDistScalar* written = dist.data.data() + base_idx;
+                        for (int c = 0; c < tile_j; c++) {
+                            const int j_global = tp.j_start + c;
+                            const double val = static_cast<double>(written[c]);
+                            update_local_nn(i_global, j_global, val);
+                            update_local_nn(j_global, i_global, val);
+                        }
+#else
                         for (int c = 0; c < tile_j; c++) {
                             const Scalar v =
                                 is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
@@ -918,6 +948,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                             update_local_nn(i_global, j_global, val);
                             update_local_nn(j_global, i_global, val);
                         }
+#endif
                     }
                 }
             }
