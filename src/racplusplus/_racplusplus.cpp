@@ -599,19 +599,16 @@ void update_cluster_dissimilarities(
         is_iter_secondary[merge.second] = 1;
     }
 
-    // Alive ids needed for distance compute/write-back in current/next sub-batches.
-    // Start with all alive ids, then drop processed secondaries batch-by-batch.
+    // Alive ids needed for distance compute/write-back in each sub-batch.
+    // Keep ids in ascending order so candidate iteration is contiguous/stable.
     std::vector<int> write_candidates;
     write_candidates.reserve(static_cast<size_t>(N));
-    std::vector<int> write_candidate_pos(static_cast<size_t>(N), -1);
+    std::vector<char> is_processed_secondary(static_cast<size_t>(N), 0);
     // NN refresh candidates (exclude iteration secondaries).
     std::vector<int> nn_candidates;
     nn_candidates.reserve(static_cast<size_t>(N));
     for (int k = 0; k < N; ++k) {
         if (!is_alive_ws[k]) continue;
-        write_candidate_pos[static_cast<size_t>(k)] =
-            static_cast<int>(write_candidates.size());
-        write_candidates.push_back(k);
         if (!is_iter_secondary[k]) {
             nn_candidates.push_back(k);
         }
@@ -678,6 +675,13 @@ void update_cluster_dissimilarities(
             precompute_cross_range(0, batch_size);
         } else {
             run_parallel_for(requested_threads, batch_size, precompute_cross_range);
+        }
+
+        write_candidates.clear();
+        for (int k = 0; k < N; ++k) {
+            if (is_alive_ws[k] && !is_processed_secondary[static_cast<size_t>(k)]) {
+                write_candidates.push_back(k);
+            }
         }
 
         const int* write_cand_data = write_candidates.data();
@@ -750,18 +754,10 @@ void update_cluster_dissimilarities(
             dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
         }
 
-        // Shrink write candidates for the next sub-batch:
-        // once a secondary is processed in this batch, it is dead for all later batches.
+        // Mark processed secondaries so future sub-batches exclude them.
         for (size_t i = 0; i < batch_size; ++i) {
             const int sid = merge_secondary_ids[i];
-            int pos = write_candidate_pos[static_cast<size_t>(sid)];
-            if (pos < 0) continue;
-            const size_t pos_u = static_cast<size_t>(pos);
-            const int last_id = write_candidates.back();
-            write_candidates[pos_u] = last_id;
-            write_candidate_pos[static_cast<size_t>(last_id)] = pos;
-            write_candidates.pop_back();
-            write_candidate_pos[static_cast<size_t>(sid)] = -1;
+            is_processed_secondary[static_cast<size_t>(sid)] = 1;
         }
         // ITEM 6: Compute NN for merge mains from contiguous merged_columns,
         // but ONLY for the last batch. Earlier batches' mains get stale NNs
@@ -807,7 +803,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
 
     const int N = static_cast<int>(clusters.size());
     const int D = static_cast<int>(base_arr.rows());
-    const int TILE = 4096;
+    const int TILE = 1024;
     const bool is_cosine = (distance_metric == "cosine");
     const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(Eigen::nbThreads()));
 
