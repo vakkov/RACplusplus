@@ -556,6 +556,7 @@ void update_cluster_dissimilarities(
     std::vector<int>& dsu_parent,
     std::vector<int>& dsu_size,
     std::vector<SymDistVector>& merged_columns_workspace,
+    std::vector<char>& is_iter_secondary_workspace,
     double max_merge_distance,
     const std::vector<char>& is_alive_ws) {
 
@@ -579,12 +580,12 @@ void update_cluster_dissimilarities(
         }
     }
 
-    // Persistent mask for secondaries in this whole merge iteration.
+    // Reused mask for secondaries in this whole merge iteration.
     // Needed because last-batch main NN refresh must skip all secondaries,
     // including those from earlier batches.
-    static std::vector<char> is_iter_secondary;
+    auto& is_iter_secondary = is_iter_secondary_workspace;
     if (static_cast<int>(is_iter_secondary.size()) < N) {
-        is_iter_secondary.assign(N, 0);
+        is_iter_secondary.resize(N, 0);
     }
     for (const auto& merge : merges) {
         is_iter_secondary[merge.second] = 1;
@@ -1876,6 +1877,7 @@ void RAC_i(
     std::vector<char> is_dead_ws(orig_N, 0);
     std::vector<char> is_changed_ws(orig_N, 0);
     std::vector<char> is_alive_ws(orig_N, 0);
+    std::vector<char> is_iter_secondary_ws(orig_N, 0);
     for (int idx : active_indices) {
         is_alive_ws[idx] = 1;
     }
@@ -1891,6 +1893,7 @@ void RAC_i(
         auto t0 = std::chrono::high_resolution_clock::now();
         update_cluster_dissimilarities(merges, clusters, dist, NO_PROCESSORS,
                                        dsu_parent, dsu_size, merged_columns_workspace,
+                                       is_iter_secondary_ws,
                                        max_merge_distance, is_alive_ws);
         auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -2010,6 +2013,7 @@ void RAC_i(
             is_alive_ws.assign(A, 1);
             is_dead_ws.assign(A, 0);
             is_changed_ws.assign(A, 0);
+            is_iter_secondary_ws.assign(A, 0);
 
             did_compact = true;
             compaction_count++;

@@ -271,6 +271,7 @@ void update_cluster_dissimilarities(
     std::vector<int>& dsu_parent,
     std::vector<int>& dsu_size,
     std::vector<SymDistVector>& merged_columns_workspace,
+    std::vector<char>& is_iter_secondary_workspace,
     double max_merge_distance,
     const std::vector<char>& is_alive_ws);
 
