@@ -936,8 +936,50 @@ void update_cluster_dissimilarities(
         // Active-only write-back avoids touching dead ids.
         const auto t_write_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                            : std::chrono::high_resolution_clock::time_point{};
+        auto set_col_active_runs = [&](int col_id, const SymDistVector& col) {
+            const size_t* row_start = dist.row_start.data();
+            const size_t col_base = row_start[static_cast<size_t>(col_id)];
+            for (size_t r = 0; r < run_count; ++r) {
+                const CandidateRun& run = run_data[r];
+
+                if (run.k_end < col_id) {
+                    for (int k = run.k_start; k <= run.k_end; ++k) {
+                        const size_t idx =
+                            row_start[static_cast<size_t>(k)] +
+                            static_cast<size_t>(col_id - k - 1);
+                        dist.data[idx] = col[k];
+                    }
+                    continue;
+                }
+
+                if (run.k_start > col_id) {
+                    const int k0 = run.k_start;
+                    SymDistScalar* dst =
+                        dist.data.data() + col_base + static_cast<size_t>(k0 - col_id - 1);
+                    const SymDistScalar* src = col.data() + static_cast<size_t>(k0);
+                    std::copy_n(src, run.len, dst);
+                    continue;
+                }
+
+                // Run intersects col_id: write left scattered and right contiguous.
+                for (int k = run.k_start; k < col_id; ++k) {
+                    const size_t idx =
+                        row_start[static_cast<size_t>(k)] +
+                        static_cast<size_t>(col_id - k - 1);
+                    dist.data[idx] = col[k];
+                }
+                if (col_id < run.k_end) {
+                    const int k0 = col_id + 1;
+                    const size_t len = static_cast<size_t>(run.k_end - col_id);
+                    SymDistScalar* dst =
+                        dist.data.data() + col_base + static_cast<size_t>(k0 - col_id - 1);
+                    const SymDistScalar* src = col.data() + static_cast<size_t>(k0);
+                    std::copy_n(src, len, dst);
+                }
+            }
+        };
         for (size_t i = 0; i < batch_size; i++) {
-            dist.set_col_active(merge_main_ids[i], merged_columns[i], write_candidates);
+            set_col_active_runs(merge_main_ids[i], merged_columns[i]);
             dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
         }
         if (profile_ops) {
@@ -1839,7 +1881,15 @@ void update_cluster_nn_dist(
         changed_main_ids.push_back(m.first);
     }
     constexpr size_t MAX_CHANGED_MAIN_SHORTLIST = 2048;
-    const bool use_changed_shortlist =
+    constexpr uint64_t SHORTLIST_DISABLE_MIN_ATTEMPTS = 50000;
+    constexpr double SHORTLIST_DISABLE_MIN_HIT_RATE = 1e-3; // 0.1%
+    static std::atomic<uint64_t> s_shortlist_attempts_total{0};
+    static std::atomic<uint64_t> s_shortlist_hits_total{0};
+    static std::atomic<int> s_shortlist_disabled{0};
+    const bool shortlist_globally_disabled =
+        (s_shortlist_disabled.load(std::memory_order_relaxed) != 0);
+    bool use_changed_shortlist =
+        !shortlist_globally_disabled &&
         (changed_main_ids.size() <= MAX_CHANGED_MAIN_SHORTLIST);
     struct ChangedMainRun {
         int k_start;
@@ -2041,9 +2091,7 @@ void update_cluster_nn_dist(
             if (use_changed_shortlist &&
                 nn_invalidated &&
                 old_nn_dist < inf) {
-                if (profile_ops) {
-                    ++local_shortlist_attempts;
-                }
+                ++local_shortlist_attempts;
                 const auto t_short_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                                    : std::chrono::high_resolution_clock::time_point{};
 
@@ -2110,9 +2158,7 @@ void update_cluster_nn_dist(
                     best_val = changed_best;
                     best_idx = changed_best_idx;
                     used_shortcut = true;
-                    if (profile_ops) {
-                        ++local_shortlist_hits;
-                    }
+                    ++local_shortlist_hits;
                 }
             }
 
@@ -2178,10 +2224,10 @@ void update_cluster_nn_dist(
             clusters[cluster_idx].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
             clusters[cluster_idx].nn_distance = best_val_d;
         }
+        shortlist_attempts_accum.fetch_add(local_shortlist_attempts, std::memory_order_relaxed);
+        shortlist_hits_accum.fetch_add(local_shortlist_hits, std::memory_order_relaxed);
+        fullscan_clusters_accum.fetch_add(local_fullscan_clusters, std::memory_order_relaxed);
         if (profile_ops) {
-            shortlist_attempts_accum.fetch_add(local_shortlist_attempts, std::memory_order_relaxed);
-            shortlist_hits_accum.fetch_add(local_shortlist_hits, std::memory_order_relaxed);
-            fullscan_clusters_accum.fetch_add(local_fullscan_clusters, std::memory_order_relaxed);
             shortlist_ns_accum.fetch_add(local_shortlist_ns, std::memory_order_relaxed);
             fullscan_ns_accum.fetch_add(local_fullscan_ns, std::memory_order_relaxed);
         }
@@ -2196,6 +2242,25 @@ void update_cluster_nn_dist(
         rescan_range(0, count);
     } else {
         run_parallel_for(requested, count, rescan_range);
+    }
+    const uint64_t call_shortlist_attempts =
+        shortlist_attempts_accum.load(std::memory_order_relaxed);
+    const uint64_t call_shortlist_hits =
+        shortlist_hits_accum.load(std::memory_order_relaxed);
+    if (call_shortlist_attempts > 0) {
+        const uint64_t total_attempts =
+            s_shortlist_attempts_total.fetch_add(call_shortlist_attempts, std::memory_order_relaxed) +
+            call_shortlist_attempts;
+        const uint64_t total_hits =
+            s_shortlist_hits_total.fetch_add(call_shortlist_hits, std::memory_order_relaxed) +
+            call_shortlist_hits;
+        if (total_attempts >= SHORTLIST_DISABLE_MIN_ATTEMPTS) {
+            const double hit_rate =
+                static_cast<double>(total_hits) / static_cast<double>(total_attempts);
+            if (hit_rate < SHORTLIST_DISABLE_MIN_HIT_RATE) {
+                s_shortlist_disabled.store(1, std::memory_order_relaxed);
+            }
+        }
     }
     if (profile_ops) {
         const auto t_rescan_total_1 = std::chrono::high_resolution_clock::now();
