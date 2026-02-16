@@ -1952,9 +1952,12 @@ void update_cluster_nn_dist(
     for (const auto& m : merges) {
         changed_main_ids.push_back(m.first);
     }
-    constexpr size_t MAX_CHANGED_MAIN_SHORTLIST = 2048;
-    constexpr uint64_t SHORTLIST_DISABLE_MIN_ATTEMPTS = 50000;
-    constexpr double SHORTLIST_DISABLE_MIN_HIT_RATE = 1e-3; // 0.1%
+    // The changed-main shortlist is only worthwhile when it reliably avoids full scans.
+    // On dense runs it can have near-zero hit rate, so disable it aggressively.
+    constexpr size_t MAX_CHANGED_MAIN_SHORTLIST = 512;
+    constexpr uint64_t SHORTLIST_DISABLE_MIN_ATTEMPTS = 4096;
+    constexpr uint64_t SHORTLIST_DISABLE_CALL_MIN_ATTEMPTS = 1024;
+    constexpr double SHORTLIST_DISABLE_MIN_HIT_RATE = 5e-3; // 0.5%
     static std::atomic<uint64_t> s_shortlist_attempts_total{0};
     static std::atomic<uint64_t> s_shortlist_hits_total{0};
     static std::atomic<int> s_shortlist_disabled{0};
@@ -2320,6 +2323,10 @@ void update_cluster_nn_dist(
     const uint64_t call_shortlist_hits =
         shortlist_hits_accum.load(std::memory_order_relaxed);
     if (call_shortlist_attempts > 0) {
+        if (call_shortlist_attempts >= SHORTLIST_DISABLE_CALL_MIN_ATTEMPTS &&
+            call_shortlist_hits == 0) {
+            s_shortlist_disabled.store(1, std::memory_order_relaxed);
+        }
         const uint64_t total_attempts =
             s_shortlist_attempts_total.fetch_add(call_shortlist_attempts, std::memory_order_relaxed) +
             call_shortlist_attempts;
