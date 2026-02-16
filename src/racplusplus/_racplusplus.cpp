@@ -662,6 +662,7 @@ void update_cluster_dissimilarities(
     std::vector<int> write_candidates;
     write_candidates.reserve(static_cast<size_t>(N));
     std::vector<char> is_processed_secondary(static_cast<size_t>(N), 0);
+    std::vector<char> is_batch_main(static_cast<size_t>(N), 0);
     // NN refresh candidates (exclude iteration secondaries).
     std::vector<int> nn_candidates;
     nn_candidates.reserve(static_cast<size_t>(N));
@@ -717,6 +718,7 @@ void update_cluster_dissimilarities(
             merge_main_sizes[i] = static_cast<double>(dsu_size[merge_main_ids[i]]);
             merge_secondary_sizes[i] = static_cast<double>(dsu_size[merge_secondary_ids[i]]);
             merge_inv_sizes[i] = 1.0 / (merge_main_sizes[i] + merge_secondary_sizes[i]);
+            is_batch_main[static_cast<size_t>(merge_main_ids[i])] = 1;
         }
 
         // Precompute triangular row bases for cross_dist(i,j), i<j.
@@ -772,10 +774,6 @@ void update_cluster_dissimilarities(
                 write_candidates.push_back(k);
             }
         }
-        if (profile_ops) {
-            const auto t_cand_1 = std::chrono::high_resolution_clock::now();
-            g_dense_ops_profile.dissim_candidate_build_ns += ns_between(t_cand_0, t_cand_1);
-        }
 
         const int* write_cand_data = write_candidates.data();
         const size_t write_cand_count = write_candidates.size();
@@ -802,6 +800,42 @@ void update_cluster_dissimilarities(
         }
         const CandidateRun* run_data = write_candidate_runs.data();
         const size_t run_count = write_candidate_runs.size();
+        std::vector<CandidateRun> write_non_main_runs;
+        write_non_main_runs.reserve(run_count);
+        for (size_t r = 0; r < run_count; ++r) {
+            const CandidateRun& run = run_data[r];
+            int seg_start = -1;
+            for (int k = run.k_start; k <= run.k_end; ++k) {
+                if (!is_batch_main[static_cast<size_t>(k)]) {
+                    if (seg_start < 0) seg_start = k;
+                    continue;
+                }
+                if (seg_start >= 0) {
+                    const int seg_end = k - 1;
+                    write_non_main_runs.push_back(
+                        CandidateRun{
+                            seg_start,
+                            seg_end,
+                            static_cast<size_t>(seg_end - seg_start + 1)
+                        });
+                    seg_start = -1;
+                }
+            }
+            if (seg_start >= 0) {
+                write_non_main_runs.push_back(
+                    CandidateRun{
+                        seg_start,
+                        run.k_end,
+                        static_cast<size_t>(run.k_end - seg_start + 1)
+                    });
+            }
+        }
+        const CandidateRun* non_main_run_data = write_non_main_runs.data();
+        const size_t non_main_run_count = write_non_main_runs.size();
+        if (profile_ops) {
+            const auto t_cand_1 = std::chrono::high_resolution_clock::now();
+            g_dense_ops_profile.dissim_candidate_build_ns += ns_between(t_cand_0, t_cand_1);
+        }
 
         // Parallel column computation over live candidates only.
         auto compute_range = [&](size_t start, size_t end) {
@@ -932,16 +966,17 @@ void update_cluster_dissimilarities(
             g_dense_ops_profile.dissim_compute_ns += ns_between(t_compute_0, t_compute_1);
         }
 
-        // Serial write-back for merge mains.
-        // Active-only write-back avoids touching dead ids.
+        // Write-back for merge mains:
+        // 1) parallel non-main writes per merge main (disjoint address sets)
+        // 2) deduplicated main-main writes once per pair
+        // 3) serial DSU unions
         const auto t_write_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                            : std::chrono::high_resolution_clock::time_point{};
         auto set_col_active_runs = [&](int col_id, const SymDistVector& col) {
             const size_t* row_start = dist.row_start.data();
             const size_t col_base = row_start[static_cast<size_t>(col_id)];
-            for (size_t r = 0; r < run_count; ++r) {
-                const CandidateRun& run = run_data[r];
-
+            for (size_t r = 0; r < non_main_run_count; ++r) {
+                const CandidateRun& run = non_main_run_data[r];
                 if (run.k_end < col_id) {
                     for (int k = run.k_start; k <= run.k_end; ++k) {
                         const size_t idx =
@@ -978,8 +1013,44 @@ void update_cluster_dissimilarities(
                 }
             }
         };
-        for (size_t i = 0; i < batch_size; i++) {
-            set_col_active_runs(merge_main_ids[i], merged_columns[i]);
+        auto write_non_main_range = [&](size_t start, size_t end) {
+            for (size_t i = start; i < end; ++i) {
+                set_col_active_runs(merge_main_ids[i], merged_columns[i]);
+            }
+        };
+        const size_t write_threads = std::min(requested_threads, batch_size);
+        if (write_threads <= 1 || batch_size < 64) {
+            write_non_main_range(0, batch_size);
+        } else {
+            run_parallel_for(requested_threads, batch_size, write_non_main_range);
+        }
+
+        // Main-main pairs are duplicated across columns; write each pair once.
+        auto write_main_pairs_range = [&](size_t start, size_t end) {
+            const size_t* row_start = dist.row_start.data();
+            SymDistScalar* dist_data = dist.data.data();
+            for (size_t i = start; i < end; ++i) {
+                const int mi = merge_main_ids[i];
+                for (size_t j = i + 1; j < batch_size; ++j) {
+                    const int mj = merge_main_ids[j];
+                    const SymDistScalar v =
+                        cross_dist[cross_row_start[i] + (j - i - 1)];
+                    const int a = (mi < mj) ? mi : mj;
+                    const int b = (mi < mj) ? mj : mi;
+                    const size_t idx =
+                        row_start[static_cast<size_t>(a)] +
+                        static_cast<size_t>(b - a - 1);
+                    dist_data[idx] = v;
+                }
+            }
+        };
+        if (write_threads <= 1 || batch_size < 64) {
+            write_main_pairs_range(0, batch_size);
+        } else {
+            run_parallel_for(requested_threads, batch_size, write_main_pairs_range);
+        }
+
+        for (size_t i = 0; i < batch_size; ++i) {
             dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
         }
         if (profile_ops) {
@@ -991,6 +1062,7 @@ void update_cluster_dissimilarities(
         for (size_t i = 0; i < batch_size; ++i) {
             const int sid = merge_secondary_ids[i];
             is_processed_secondary[static_cast<size_t>(sid)] = 1;
+            is_batch_main[static_cast<size_t>(merge_main_ids[i])] = 0;
         }
         // ITEM 6: Compute NN for merge mains from contiguous merged_columns,
         // but ONLY for the last batch. Earlier batches' mains get stale NNs
