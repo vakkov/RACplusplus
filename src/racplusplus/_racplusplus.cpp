@@ -219,6 +219,14 @@ static inline void run_parallel_for(size_t requested_threads, size_t total, Fn&&
     pool.parallel_for(total, std::forward<Fn>(fn));
 }
 
+static inline int resolve_processor_count(int no_processors) {
+    if (no_processors > 0) {
+        return no_processors;
+    }
+    const unsigned int hc = std::thread::hardware_concurrency();
+    return (hc != 0) ? static_cast<int>(hc) : 8;
+}
+
 //--------------------DSU (Disjoint Set Union)------------------------------------
 static inline int dsu_find(std::vector<int>& parent, int x) {
     while (parent[x] != x) {
@@ -591,23 +599,23 @@ void update_cluster_dissimilarities(
         is_iter_secondary[merge.second] = 1;
     }
 
-    // Alive ids needed for distance compute/write-back this iteration.
-    // Must include secondaries: future sub-batches still read their distances
-    // until those merges are processed.
+    // Alive ids needed for distance compute/write-back in current/next sub-batches.
+    // Start with all alive ids, then drop processed secondaries batch-by-batch.
     std::vector<int> write_candidates;
     write_candidates.reserve(static_cast<size_t>(N));
+    std::vector<int> write_candidate_pos(static_cast<size_t>(N), -1);
     // NN refresh candidates (exclude iteration secondaries).
     std::vector<int> nn_candidates;
     nn_candidates.reserve(static_cast<size_t>(N));
     for (int k = 0; k < N; ++k) {
         if (!is_alive_ws[k]) continue;
+        write_candidate_pos[static_cast<size_t>(k)] =
+            static_cast<int>(write_candidates.size());
         write_candidates.push_back(k);
         if (!is_iter_secondary[k]) {
             nn_candidates.push_back(k);
         }
     }
-    const int* write_cand_data = write_candidates.data();
-    const size_t write_cand_count = write_candidates.size();
 
     // Reuse per-batch metadata buffers across sub-batches.
     std::vector<int> merge_main_ids(max_batch);
@@ -671,6 +679,9 @@ void update_cluster_dissimilarities(
         } else {
             run_parallel_for(requested_threads, batch_size, precompute_cross_range);
         }
+
+        const int* write_cand_data = write_candidates.data();
+        const size_t write_cand_count = write_candidates.size();
 
         // Parallel column computation over live candidates only.
         auto compute_range = [&](size_t start, size_t end) {
@@ -737,6 +748,20 @@ void update_cluster_dissimilarities(
         for (size_t i = 0; i < batch_size; i++) {
             dist.set_col_active(merge_main_ids[i], merged_columns[i], write_candidates);
             dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
+        }
+
+        // Shrink write candidates for the next sub-batch:
+        // once a secondary is processed in this batch, it is dead for all later batches.
+        for (size_t i = 0; i < batch_size; ++i) {
+            const int sid = merge_secondary_ids[i];
+            int pos = write_candidate_pos[static_cast<size_t>(sid)];
+            if (pos < 0) continue;
+            const size_t pos_u = static_cast<size_t>(pos);
+            const int last_id = write_candidates.back();
+            write_candidates[pos_u] = last_id;
+            write_candidate_pos[static_cast<size_t>(last_id)] = pos;
+            write_candidates.pop_back();
+            write_candidate_pos[static_cast<size_t>(sid)] = -1;
         }
         // ITEM 6: Compute NN for merge mains from contiguous merged_columns,
         // but ONLY for the last batch. Earlier batches' mains get stale NNs
@@ -1649,39 +1674,66 @@ void update_cluster_nn_dist(
         return;
     }
 
+    // Hybrid full-rescan path:
+    // when live occupancy is low, scan only alive/non-dead ids to avoid
+    // wasted distance loads and branch checks on dead entries.
+    // Keep ascending id order to preserve deterministic tie behavior.
+    std::vector<int> scan_candidates;
+    const int* scan_data = nullptr;
+    size_t scan_count = 0;
+    bool use_scan_candidates = false;
+    constexpr size_t SCAN_CANDIDATE_NUM = 3; // 75% threshold: live < 0.75 * N
+    constexpr size_t SCAN_CANDIDATE_DEN = 4;
+    if (active_indices.size() * SCAN_CANDIDATE_DEN <
+        static_cast<size_t>(N) * SCAN_CANDIDATE_NUM) {
+        const char* alive = is_alive_ws.data();
+        const char* dead = is_dead_ws.data();
+        scan_candidates.reserve(active_indices.size());
+        for (int k = 0; k < N; ++k) {
+            if (alive[k] && !dead[k]) {
+                scan_candidates.push_back(k);
+            }
+        }
+        scan_data = scan_candidates.data();
+        scan_count = scan_candidates.size();
+        use_scan_candidates =
+            (scan_count * SCAN_CANDIDATE_DEN <
+             static_cast<size_t>(N) * SCAN_CANDIDATE_NUM);
+    }
+
     auto rescan_range = [&](size_t start, size_t end) {
         const char* alive = is_alive_ws.data();
         const char* dead = is_dead_ws.data();
         const size_t* row_start = dist.row_start.data();
         const SymDistScalar* dist_data = dist.data.data();
+        const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
         for (size_t i = start; i < end; i++) {
             const int cluster_idx = needs_rescan[i];
             const int cid = clusters[cluster_idx].id;
-            double best_val = std::numeric_limits<double>::infinity();
+            SymDistScalar best_val = inf;
             int best_idx = -1;
             bool used_shortcut = false;
 
             const int old_nn = clusters[cluster_idx].nn;
-            const double old_nn_dist = clusters[cluster_idx].nn_distance;
+            const SymDistScalar old_nn_dist =
+                static_cast<SymDistScalar>(clusters[cluster_idx].nn_distance);
             const bool nn_invalidated =
                 (old_nn != -1) &&
                 (dead[old_nn] || is_changed_ws[old_nn]);
             if (use_changed_shortlist &&
                 nn_invalidated &&
-                old_nn_dist < std::numeric_limits<double>::infinity()) {
+                old_nn_dist < inf) {
 
-                double changed_best = std::numeric_limits<double>::infinity();
+                SymDistScalar changed_best = inf;
                 int changed_best_idx = -1;
                 const size_t cid_base = row_start[static_cast<size_t>(cid)];
 
                 for (int k : changed_main_ids) {
                     if (k == cid || !alive[k] || dead[k]) continue;
-                    const double v = (k < cid)
-                        ? static_cast<double>(
-                            dist_data[row_start[static_cast<size_t>(k)] +
-                                      static_cast<size_t>(cid - k - 1)])
-                        : static_cast<double>(
-                            dist_data[cid_base + static_cast<size_t>(k - cid - 1)]);
+                    const SymDistScalar v = (k < cid)
+                        ? dist_data[row_start[static_cast<size_t>(k)] +
+                                    static_cast<size_t>(cid - k - 1)]
+                        : dist_data[cid_base + static_cast<size_t>(k - cid - 1)];
                     if (v < changed_best ||
                         (v == changed_best && (changed_best_idx == -1 || k < changed_best_idx))) {
                         changed_best = v;
@@ -1699,35 +1751,52 @@ void update_cluster_nn_dist(
             }
 
             if (!used_shortcut) {
-                // k < cid: scattered upper-triangle entries
-                for (int k = 0; k < cid; ++k) {
-                    if (!alive[k] || dead[k]) continue;
-                    const double v = static_cast<double>(
-                        dist_data[row_start[static_cast<size_t>(k)] +
-                                  static_cast<size_t>(cid - k - 1)]);
-                    if (v < best_val) {
-                        best_val = v;
-                        best_idx = k;
-                    }
-                }
-
-                // k > cid: contiguous tail
-                if (cid + 1 < N) {
-                    const size_t base = row_start[static_cast<size_t>(cid)];
-                    const SymDistScalar* tail = dist_data + base;
-                    for (int k = cid + 1; k < N; ++k) {
-                        if (!alive[k] || dead[k]) continue;
-                        const double v = static_cast<double>(tail[k - cid - 1]);
+                if (use_scan_candidates) {
+                    const size_t cid_base = row_start[static_cast<size_t>(cid)];
+                    for (size_t c = 0; c < scan_count; ++c) {
+                        const int k = scan_data[c];
+                        if (k == cid) continue;
+                        const SymDistScalar v = (k < cid)
+                            ? dist_data[row_start[static_cast<size_t>(k)] +
+                                        static_cast<size_t>(cid - k - 1)]
+                            : dist_data[cid_base + static_cast<size_t>(k - cid - 1)];
                         if (v < best_val) {
                             best_val = v;
                             best_idx = k;
                         }
                     }
+                } else {
+                    // k < cid: scattered upper-triangle entries
+                    for (int k = 0; k < cid; ++k) {
+                        if (!alive[k] || dead[k]) continue;
+                        const SymDistScalar v =
+                            dist_data[row_start[static_cast<size_t>(k)] +
+                                      static_cast<size_t>(cid - k - 1)];
+                        if (v < best_val) {
+                            best_val = v;
+                            best_idx = k;
+                        }
+                    }
+
+                    // k > cid: contiguous tail
+                    if (cid + 1 < N) {
+                        const size_t base = row_start[static_cast<size_t>(cid)];
+                        const SymDistScalar* tail = dist_data + base;
+                        for (int k = cid + 1; k < N; ++k) {
+                            if (!alive[k] || dead[k]) continue;
+                            const SymDistScalar v = tail[k - cid - 1];
+                            if (v < best_val) {
+                                best_val = v;
+                                best_idx = k;
+                            }
+                        }
+                    }
                 }
             }
 
-            clusters[cluster_idx].nn = (best_val < max_merge_distance) ? best_idx : -1;
-            clusters[cluster_idx].nn_distance = best_val;
+            const double best_val_d = static_cast<double>(best_val);
+            clusters[cluster_idx].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
+            clusters[cluster_idx].nn_distance = best_val_d;
         }
     };
 
@@ -2192,13 +2261,21 @@ std::vector<int> RAC(
     int no_processors = 0,
     std::string distance_metric = "euclidean") {
 
+    // const int NO_PROCESSORS = resolve_processor_count(no_processors);
+    // Eigen::setNbThreads(NO_PROCESSORS);
+
     // Transpose (+ normalize for cosine) into D×N working copy.
+    const auto t_pre_start = std::chrono::high_resolution_clock::now();
     Eigen::MatrixXd base_arr;
     if (distance_metric == "cosine") {
         base_arr = base_arr_in.transpose().colwise().normalized();
     } else {
         base_arr = base_arr_in.transpose();
     }
+    const auto t_pre_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Preprocessing: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t_pre_end - t_pre_start).count()
+              << "ms" << std::endl;
 
     return RAC_impl(base_arr, max_merge_distance, connectivity, batch_size, no_processors, distance_metric);
 }
@@ -2239,6 +2316,8 @@ py::array RAC_py(
 
     const int N = static_cast<int>(buf.shape[0]);
     const int D = static_cast<int>(buf.shape[1]);
+    // const int NO_PROCESSORS = resolve_processor_count(no_processors);
+    // Eigen::setNbThreads(NO_PROCESSORS);
 
     const std::string format = buf.format;
     const bool is_float64 = (format == py::format_descriptor<double>::format());
@@ -2256,6 +2335,7 @@ py::array RAC_py(
     }
 
     if (is_float64) {
+        const auto t_pre_start = std::chrono::high_resolution_clock::now();
         Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
             static_cast<const double*>(buf.ptr), D, N);
 
@@ -2265,6 +2345,10 @@ py::array RAC_py(
         } else {
             base_arr = base_transposed;
         }
+        const auto t_pre_end = std::chrono::high_resolution_clock::now();
+        std::cout << "Preprocessing: "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(t_pre_end - t_pre_start).count()
+                  << "ms" << std::endl;
 
         std::vector<int> cluster_labels = RAC_impl(
             base_arr,
@@ -2277,6 +2361,7 @@ py::array RAC_py(
     }
 
     // Float32 input: keep full no-connectivity flow in float32.
+    const auto t_pre_start = std::chrono::high_resolution_clock::now();
     Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic>> base_transposed(
         static_cast<const float*>(buf.ptr), D, N);
 
@@ -2287,6 +2372,10 @@ py::array RAC_py(
         } else {
             base_arr = base_transposed;
         }
+        const auto t_pre_end = std::chrono::high_resolution_clock::now();
+        std::cout << "Preprocessing: "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(t_pre_end - t_pre_start).count()
+                  << "ms" << std::endl;
 
         std::vector<int> cluster_labels = RAC_impl_no_connectivity(
             base_arr,
@@ -2303,6 +2392,10 @@ py::array RAC_py(
     } else {
         base_arr = base_transposed.cast<double>();
     }
+    const auto t_pre_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Preprocessing: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t_pre_end - t_pre_start).count()
+              << "ms" << std::endl;
 
     std::vector<int> cluster_labels = RAC_impl(
         base_arr,
