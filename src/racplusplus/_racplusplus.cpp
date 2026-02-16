@@ -31,6 +31,7 @@ namespace py = pybind11;
 #include <random>
 #include <numeric>
 #include <cmath>
+#include <cstdlib>
 #if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE
 #include <immintrin.h>
 #endif
@@ -47,6 +48,46 @@ std::vector<long> MISC_MERGE_DURATIONS;
 std::vector<long> INITIAL_NEIGHBOR_DURATIONS;
 std::vector<long> HASH_DURATIONS;
 std::vector<double> UPDATE_PERCENTAGES;
+
+struct DenseOpsProfile {
+    long long dissim_cross_ns = 0;
+    long long dissim_candidate_build_ns = 0;
+    long long dissim_compute_ns = 0;
+    long long dissim_writeback_ns = 0;
+    long long dissim_last_batch_nn_ns = 0;
+    long long nn_changed_shortlist_prep_ns = 0;
+    long long nn_scan_run_build_ns = 0;
+    long long nn_rescan_total_ns = 0;
+    long long nn_shortlist_eval_ns = 0;
+    long long nn_fullscan_eval_ns = 0;
+    uint64_t nn_rescan_clusters = 0;
+    uint64_t nn_shortlist_attempts = 0;
+    uint64_t nn_shortlist_hits = 0;
+    uint64_t nn_fullscan_clusters = 0;
+
+    void reset() { *this = DenseOpsProfile{}; }
+};
+
+static DenseOpsProfile g_dense_ops_profile;
+
+static inline bool racpp_profile_ops_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("RACPP_PROFILE_OPS");
+        cached = (env != nullptr && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static inline long long ns_between(
+    const std::chrono::high_resolution_clock::time_point& t0,
+    const std::chrono::high_resolution_clock::time_point& t1) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+}
+
+static inline double ns_to_ms(long long ns) {
+    return static_cast<double>(ns) / 1e6;
+}
 
 #if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE && \
     defined(__AVX2__) && defined(__FMA__) && \
@@ -587,6 +628,7 @@ void update_cluster_dissimilarities(
     if (merges.empty()) {
         return;
     }
+    const bool profile_ops = racpp_profile_ops_enabled();
 
     const size_t merge_count = merges.size();
     const int N = dist.N;
@@ -710,17 +752,29 @@ void update_cluster_dissimilarities(
         };
 
         const size_t cross_threads = std::min(requested_threads, batch_size);
+        const auto t_cross_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                           : std::chrono::high_resolution_clock::time_point{};
         if (cross_threads <= 1 || batch_size < 128) {
             precompute_cross_range(0, batch_size);
         } else {
             run_parallel_for(requested_threads, batch_size, precompute_cross_range);
         }
+        if (profile_ops) {
+            const auto t_cross_1 = std::chrono::high_resolution_clock::now();
+            g_dense_ops_profile.dissim_cross_ns += ns_between(t_cross_0, t_cross_1);
+        }
 
+        const auto t_cand_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                          : std::chrono::high_resolution_clock::time_point{};
         write_candidates.clear();
         for (int k = 0; k < N; ++k) {
             if (is_alive_ws[k] && !is_processed_secondary[static_cast<size_t>(k)]) {
                 write_candidates.push_back(k);
             }
+        }
+        if (profile_ops) {
+            const auto t_cand_1 = std::chrono::high_resolution_clock::now();
+            g_dense_ops_profile.dissim_candidate_build_ns += ns_between(t_cand_0, t_cand_1);
         }
 
         const int* write_cand_data = write_candidates.data();
@@ -866,17 +920,29 @@ void update_cluster_dissimilarities(
         };
 
         size_t no_threads = std::min(requested_threads, batch_size);
+        const auto t_compute_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                             : std::chrono::high_resolution_clock::time_point{};
         if (no_threads <= 1) {
             compute_range(0, batch_size);
         } else {
             run_parallel_for(requested_threads, batch_size, compute_range);
         }
+        if (profile_ops) {
+            const auto t_compute_1 = std::chrono::high_resolution_clock::now();
+            g_dense_ops_profile.dissim_compute_ns += ns_between(t_compute_0, t_compute_1);
+        }
 
         // Serial write-back for merge mains.
         // Active-only write-back avoids touching dead ids.
+        const auto t_write_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                           : std::chrono::high_resolution_clock::time_point{};
         for (size_t i = 0; i < batch_size; i++) {
             dist.set_col_active(merge_main_ids[i], merged_columns[i], write_candidates);
             dsu_union(dsu_parent, dsu_size, merge_main_ids[i], merge_secondary_ids[i]);
+        }
+        if (profile_ops) {
+            const auto t_write_1 = std::chrono::high_resolution_clock::now();
+            g_dense_ops_profile.dissim_writeback_ns += ns_between(t_write_0, t_write_1);
         }
 
         // Mark processed secondaries so future sub-batches exclude them.
@@ -890,6 +956,8 @@ void update_cluster_dissimilarities(
         // update_cluster_nn_dist instead.
         const bool is_last_batch = (batch_end >= merge_count);
         if (is_last_batch) {
+            const auto t_last_nn_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                                 : std::chrono::high_resolution_clock::time_point{};
             for (size_t i = 0; i < batch_size; i++) {
                 const int main_id = merge_main_ids[i];
                 const SymDistScalar* col_data = merged_columns[i].data();
@@ -912,6 +980,11 @@ void update_cluster_dissimilarities(
                 const double best_val_d = static_cast<double>(best_val);
                 clusters[main_id].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
                 clusters[main_id].nn_distance = best_val_d;
+            }
+            if (profile_ops) {
+                const auto t_last_nn_1 = std::chrono::high_resolution_clock::now();
+                g_dense_ops_profile.dissim_last_batch_nn_ns +=
+                    ns_between(t_last_nn_0, t_last_nn_1);
             }
         }
     }
@@ -1738,6 +1811,7 @@ void update_cluster_nn_dist(
     std::vector<char>& is_changed_ws) {
 
     if (merges.empty()) return;
+    const bool profile_ops = racpp_profile_ops_enabled();
 
     const int N = dist.N;
     if (static_cast<int>(is_dead_ws.size()) < N) is_dead_ws.assign(N, 0);
@@ -1767,6 +1841,53 @@ void update_cluster_nn_dist(
     constexpr size_t MAX_CHANGED_MAIN_SHORTLIST = 2048;
     const bool use_changed_shortlist =
         (changed_main_ids.size() <= MAX_CHANGED_MAIN_SHORTLIST);
+    struct ChangedMainRun {
+        int k_start;
+        int k_end;
+        size_t len;
+    };
+    std::vector<ChangedMainRun> changed_main_runs;
+    const ChangedMainRun* changed_run_data = nullptr;
+    size_t changed_run_count = 0;
+    const auto t_changed_prep_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                              : std::chrono::high_resolution_clock::time_point{};
+    if (use_changed_shortlist) {
+        std::vector<int> changed_main_live;
+        changed_main_live.reserve(changed_main_ids.size());
+        for (int k : changed_main_ids) {
+            if (is_alive_ws[k] && !is_dead_ws[k]) {
+                changed_main_live.push_back(k);
+            }
+        }
+        std::sort(changed_main_live.begin(), changed_main_live.end());
+        changed_main_live.erase(
+            std::unique(changed_main_live.begin(), changed_main_live.end()),
+            changed_main_live.end());
+        changed_main_runs.reserve(
+            changed_main_live.size() > 0 ? changed_main_live.size() / 4 : 0);
+        if (!changed_main_live.empty()) {
+            size_t run_start = 0;
+            const size_t count = changed_main_live.size();
+            for (size_t c = 1; c <= count; ++c) {
+                const bool is_break =
+                    (c == count) ||
+                    (changed_main_live[c] != changed_main_live[c - 1] + 1);
+                if (!is_break) continue;
+                const int k0 = changed_main_live[run_start];
+                const int k1 = changed_main_live[c - 1];
+                changed_main_runs.push_back(
+                    ChangedMainRun{k0, k1, c - run_start});
+                run_start = c;
+            }
+        }
+        changed_run_data = changed_main_runs.data();
+        changed_run_count = changed_main_runs.size();
+    }
+    if (profile_ops) {
+        const auto t_changed_prep_1 = std::chrono::high_resolution_clock::now();
+        g_dense_ops_profile.nn_changed_shortlist_prep_ns +=
+            ns_between(t_changed_prep_0, t_changed_prep_1);
+    }
 
     std::vector<int> needs_rescan;
     needs_rescan.reserve(active_indices.size());
@@ -1808,6 +1929,8 @@ void update_cluster_nn_dist(
     std::vector<ScanRun> scan_runs;
     const ScanRun* scan_run_data = nullptr;
     size_t scan_run_count = 0;
+    const auto t_scanrun_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                         : std::chrono::high_resolution_clock::time_point{};
     {
         const char* alive = is_alive_ws.data();
         const char* dead = is_dead_ws.data();
@@ -1834,13 +1957,27 @@ void update_cluster_nn_dist(
         scan_run_data = scan_runs.data();
         scan_run_count = scan_runs.size();
     }
+    if (profile_ops) {
+        const auto t_scanrun_1 = std::chrono::high_resolution_clock::now();
+        g_dense_ops_profile.nn_scan_run_build_ns += ns_between(t_scanrun_0, t_scanrun_1);
+    }
+
+    std::atomic<uint64_t> shortlist_attempts_accum{0};
+    std::atomic<uint64_t> shortlist_hits_accum{0};
+    std::atomic<uint64_t> fullscan_clusters_accum{0};
+    std::atomic<long long> shortlist_ns_accum{0};
+    std::atomic<long long> fullscan_ns_accum{0};
 
     auto rescan_range = [&](size_t start, size_t end) {
-        const char* alive = is_alive_ws.data();
         const char* dead = is_dead_ws.data();
         const size_t* row_start = dist.row_start.data();
         const SymDistScalar* dist_data = dist.data.data();
         const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
+        uint64_t local_shortlist_attempts = 0;
+        uint64_t local_shortlist_hits = 0;
+        uint64_t local_fullscan_clusters = 0;
+        long long local_shortlist_ns = 0;
+        long long local_fullscan_ns = 0;
         auto consider_contiguous_tail = [&](const SymDistScalar* seg,
                                             int k_start,
                                             size_t len,
@@ -1904,22 +2041,67 @@ void update_cluster_nn_dist(
             if (use_changed_shortlist &&
                 nn_invalidated &&
                 old_nn_dist < inf) {
+                if (profile_ops) {
+                    ++local_shortlist_attempts;
+                }
+                const auto t_short_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                                   : std::chrono::high_resolution_clock::time_point{};
 
                 SymDistScalar changed_best = inf;
                 int changed_best_idx = -1;
                 const size_t cid_base = row_start[static_cast<size_t>(cid)];
+                const SymDistScalar* cid_tail = dist_data + cid_base;
 
-                for (int k : changed_main_ids) {
-                    if (k == cid || !alive[k] || dead[k]) continue;
-                    const SymDistScalar v = (k < cid)
-                        ? dist_data[row_start[static_cast<size_t>(k)] +
-                                    static_cast<size_t>(cid - k - 1)]
-                        : dist_data[cid_base + static_cast<size_t>(k - cid - 1)];
-                    if (v < changed_best ||
-                        (v == changed_best && (changed_best_idx == -1 || k < changed_best_idx))) {
-                        changed_best = v;
-                        changed_best_idx = k;
+                for (size_t r = 0; r < changed_run_count; ++r) {
+                    const ChangedMainRun& run = changed_run_data[r];
+
+                    if (run.k_end < cid) {
+                        for (int k = run.k_start; k <= run.k_end; ++k) {
+                            const SymDistScalar v =
+                                dist_data[row_start[static_cast<size_t>(k)] +
+                                          static_cast<size_t>(cid - k - 1)];
+                            if (v < changed_best ||
+                                (v == changed_best &&
+                                 (changed_best_idx == -1 || k < changed_best_idx))) {
+                                changed_best = v;
+                                changed_best_idx = k;
+                            }
+                        }
+                        continue;
                     }
+
+                    if (run.k_start > cid) {
+                        const SymDistScalar* seg =
+                            cid_tail + static_cast<size_t>(run.k_start - cid - 1);
+                        consider_contiguous_tail(
+                            seg, run.k_start, run.len, changed_best, changed_best_idx);
+                        continue;
+                    }
+
+                    // Run intersects cid.
+                    for (int k = run.k_start; k < cid; ++k) {
+                        const SymDistScalar v =
+                            dist_data[row_start[static_cast<size_t>(k)] +
+                                      static_cast<size_t>(cid - k - 1)];
+                        if (v < changed_best ||
+                            (v == changed_best &&
+                             (changed_best_idx == -1 || k < changed_best_idx))) {
+                            changed_best = v;
+                            changed_best_idx = k;
+                        }
+                    }
+                    if (cid < run.k_end) {
+                        const int k0 = cid + 1;
+                        const size_t len = static_cast<size_t>(run.k_end - cid);
+                        const SymDistScalar* seg =
+                            cid_tail + static_cast<size_t>(k0 - cid - 1);
+                        consider_contiguous_tail(
+                            seg, k0, len, changed_best, changed_best_idx);
+                    }
+                }
+                if (profile_ops) {
+                    const auto t_short_1 = std::chrono::high_resolution_clock::now();
+                    local_shortlist_ns += ns_between(t_short_0, t_short_1);
                 }
 
                 // Safe skip of full scan: changed set produced a strictly better NN than
@@ -1928,10 +2110,18 @@ void update_cluster_nn_dist(
                     best_val = changed_best;
                     best_idx = changed_best_idx;
                     used_shortcut = true;
+                    if (profile_ops) {
+                        ++local_shortlist_hits;
+                    }
                 }
             }
 
             if (!used_shortcut) {
+                if (profile_ops) {
+                    ++local_fullscan_clusters;
+                }
+                const auto t_full_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                                  : std::chrono::high_resolution_clock::time_point{};
                 const size_t cid_base = row_start[static_cast<size_t>(cid)];
                 const SymDistScalar* tail = dist_data + cid_base;
                 for (size_t r = 0; r < scan_run_count; ++r) {
@@ -1978,21 +2168,49 @@ void update_cluster_nn_dist(
                         consider_contiguous_tail(seg, k0, len, best_val, best_idx);
                     }
                 }
+                if (profile_ops) {
+                    const auto t_full_1 = std::chrono::high_resolution_clock::now();
+                    local_fullscan_ns += ns_between(t_full_0, t_full_1);
+                }
             }
 
             const double best_val_d = static_cast<double>(best_val);
             clusters[cluster_idx].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
             clusters[cluster_idx].nn_distance = best_val_d;
         }
+        if (profile_ops) {
+            shortlist_attempts_accum.fetch_add(local_shortlist_attempts, std::memory_order_relaxed);
+            shortlist_hits_accum.fetch_add(local_shortlist_hits, std::memory_order_relaxed);
+            fullscan_clusters_accum.fetch_add(local_fullscan_clusters, std::memory_order_relaxed);
+            shortlist_ns_accum.fetch_add(local_shortlist_ns, std::memory_order_relaxed);
+            fullscan_ns_accum.fetch_add(local_fullscan_ns, std::memory_order_relaxed);
+        }
     };
 
     const size_t count = needs_rescan.size();
     const size_t no_threads = std::min(requested, count);
+    const auto t_rescan_total_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                              : std::chrono::high_resolution_clock::time_point{};
 
     if (no_threads <= 1) {
         rescan_range(0, count);
     } else {
         run_parallel_for(requested, count, rescan_range);
+    }
+    if (profile_ops) {
+        const auto t_rescan_total_1 = std::chrono::high_resolution_clock::now();
+        g_dense_ops_profile.nn_rescan_total_ns += ns_between(t_rescan_total_0, t_rescan_total_1);
+        g_dense_ops_profile.nn_rescan_clusters += static_cast<uint64_t>(count);
+        g_dense_ops_profile.nn_shortlist_attempts +=
+            shortlist_attempts_accum.load(std::memory_order_relaxed);
+        g_dense_ops_profile.nn_shortlist_hits +=
+            shortlist_hits_accum.load(std::memory_order_relaxed);
+        g_dense_ops_profile.nn_fullscan_clusters +=
+            fullscan_clusters_accum.load(std::memory_order_relaxed);
+        g_dense_ops_profile.nn_shortlist_eval_ns +=
+            shortlist_ns_accum.load(std::memory_order_relaxed);
+        g_dense_ops_profile.nn_fullscan_eval_ns +=
+            fullscan_ns_accum.load(std::memory_order_relaxed);
     }
 
     // Clean up (resets both 1 and 2 to 0).
@@ -2151,6 +2369,11 @@ void RAC_i(
     std::vector<int>& dsu_parent,
     std::vector<int>& dsu_size
     ) {
+
+    const bool profile_ops = racpp_profile_ops_enabled();
+    if (profile_ops) {
+        g_dense_ops_profile.reset();
+    }
 
     long total_dissim = 0, total_nn = 0, total_remove = 0, total_find = 0, total_compact = 0;
     int iteration = 0;
@@ -2338,6 +2561,25 @@ void RAC_i(
               << " | remove: " << total_remove << "ms"
               << " | find_rnn: " << total_find << "ms"
               << " | compact: " << total_compact << "ms" << std::endl;
+    if (profile_ops) {
+        std::cerr << "RAC profile (dissim): cross=" << ns_to_ms(g_dense_ops_profile.dissim_cross_ns) << "ms"
+                  << " | cand_build=" << ns_to_ms(g_dense_ops_profile.dissim_candidate_build_ns) << "ms"
+                  << " | compute=" << ns_to_ms(g_dense_ops_profile.dissim_compute_ns) << "ms"
+                  << " | writeback=" << ns_to_ms(g_dense_ops_profile.dissim_writeback_ns) << "ms"
+                  << " | last_batch_nn=" << ns_to_ms(g_dense_ops_profile.dissim_last_batch_nn_ns) << "ms"
+                  << std::endl;
+        std::cerr << "RAC profile (nn_dist): shortlist_prep="
+                  << ns_to_ms(g_dense_ops_profile.nn_changed_shortlist_prep_ns) << "ms"
+                  << " | scan_run_build=" << ns_to_ms(g_dense_ops_profile.nn_scan_run_build_ns) << "ms"
+                  << " | rescan_total=" << ns_to_ms(g_dense_ops_profile.nn_rescan_total_ns) << "ms"
+                  << " | shortlist_eval=" << ns_to_ms(g_dense_ops_profile.nn_shortlist_eval_ns) << "ms"
+                  << " | fullscan_eval=" << ns_to_ms(g_dense_ops_profile.nn_fullscan_eval_ns) << "ms"
+                  << " | rescans=" << g_dense_ops_profile.nn_rescan_clusters
+                  << " | shortlist_attempts=" << g_dense_ops_profile.nn_shortlist_attempts
+                  << " | shortlist_hits=" << g_dense_ops_profile.nn_shortlist_hits
+                  << " | fullscan_clusters=" << g_dense_ops_profile.nn_fullscan_clusters
+                  << std::endl;
+    }
 }
 
 template <typename Scalar>
