@@ -1898,6 +1898,7 @@ void RAC_i(
 
     // Compaction state.
     bool did_compact = false;
+    int compaction_count = 0;
     std::vector<int> orig_dsu_parent;
     std::vector<int> compact_to_orig;
 
@@ -1928,29 +1929,43 @@ void RAC_i(
         }
         auto t3 = std::chrono::high_resolution_clock::now();
 
-        // =================================================================
-        // ITEM 5: Compact when active count drops below half of current N.
-        // Rebuilds dist, clusters, DSU in [0..A) space so that min_in_col,
-        // get_col_into, etc. scan A entries instead of N.
-        // =================================================================
-        if (!did_compact &&
-            active_indices.size() * 2 < static_cast<size_t>(dist.N) &&
-            active_indices.size() > 1) {
+        // Compact repeatedly (with guards) so later iterations scan smaller N.
+        // Hysteresis/limits avoid spending too much time in A^2 rebuilds.
+        const size_t active_count = active_indices.size();
+        const size_t curr_n = static_cast<size_t>(dist.N);
+        constexpr size_t MIN_COMPACT_ACTIVE = 64;
+        constexpr size_t MIN_COMPACT_N = 8192;
+        constexpr size_t MIN_COMPACT_DROP = 4096;
+        constexpr int MAX_COMPACTIONS = 2;
+        const bool should_compact =
+            active_count > MIN_COMPACT_ACTIVE &&
+            curr_n >= MIN_COMPACT_N &&
+            compaction_count < MAX_COMPACTIONS &&
+            (curr_n - active_count) >= MIN_COMPACT_DROP &&
+            (active_count * 5 < curr_n * 3);  // active < 60% of current N
+
+        if (should_compact) {
 
             const int A = static_cast<int>(active_indices.size());
+            const int old_N = dist.N;
 
             std::vector<int> sorted_active = active_indices;
             std::sort(sorted_active.begin(), sorted_active.end());
 
-            compact_to_orig.resize(A);
+            std::vector<int> new_compact_to_orig(A);
             std::vector<int> orig_to_compact(dist.N, -1);
             for (int i = 0; i < A; i++) {
-                compact_to_orig[i] = sorted_active[i];
-                orig_to_compact[sorted_active[i]] = i;
+                const int old_id = sorted_active[i];
+                orig_to_compact[old_id] = i;
+                new_compact_to_orig[i] = did_compact
+                    ? compact_to_orig[old_id]
+                    : old_id;
             }
 
-            // Save original DSU for label assignment.
-            orig_dsu_parent = dsu_parent;
+            // Save original DSU for label assignment on first compaction.
+            if (!did_compact) {
+                orig_dsu_parent = dsu_parent;
+            }
 
             // Build compact distance matrix (parallel by row).
             SymDistMatrix new_dist(A);
@@ -1958,11 +1973,11 @@ void RAC_i(
                 auto copy_range = [&](size_t start, size_t end) {
                     for (size_t i = start; i < end; i++) {
                         const int ii = static_cast<int>(i);
-                        const int oi = compact_to_orig[ii];
+                        const int oi = sorted_active[ii];
                         for (int j = ii + 1; j < A; j++) {
                             new_dist.data[new_dist.tri_idx(ii, j)] =
                                 static_cast<SymDistScalar>(
-                                    dist.get(oi, compact_to_orig[j]));
+                                    dist.get(oi, sorted_active[j]));
                         }
                     }
                 };
@@ -1982,7 +1997,7 @@ void RAC_i(
             new_clusters.reserve(A);
             for (int i = 0; i < A; i++) {
                 new_clusters.emplace_back(i);
-                Cluster& oc = clusters[compact_to_orig[i]];
+                Cluster& oc = clusters[sorted_active[i]];
                 const bool has_mapped_nn = (oc.nn >= 0 && orig_to_compact[oc.nn] >= 0);
                 new_clusters[i].nn = has_mapped_nn ? orig_to_compact[oc.nn] : -1;
                 new_clusters[i].nn_distance =
@@ -1999,12 +2014,13 @@ void RAC_i(
             // Rebuild compact DSU.
             std::vector<int> new_dsu_size(A);
             for (int i = 0; i < A; i++) {
-                new_dsu_size[i] = dsu_size[compact_to_orig[i]];
+                new_dsu_size[i] = dsu_size[sorted_active[i]];
             }
             dsu_parent.resize(A);
             std::iota(dsu_parent.begin(), dsu_parent.end(), 0);
             dsu_size = std::move(new_dsu_size);
 
+            compact_to_orig = std::move(new_compact_to_orig);
             // Resize workspaces.
             merged_columns_workspace.clear();
             is_alive_ws.assign(A, 1);
@@ -2012,10 +2028,11 @@ void RAC_i(
             is_changed_ws.assign(A, 0);
 
             did_compact = true;
+            compaction_count++;
 
             auto tc = std::chrono::high_resolution_clock::now();
             total_compact += std::chrono::duration_cast<std::chrono::milliseconds>(tc - t3).count();
-            std::cerr << "Compacted: " << orig_N << " -> " << A
+            std::cerr << "Compacted: " << old_N << " -> " << A
                       << " ("
                       << std::chrono::duration_cast<std::chrono::milliseconds>(tc - t3).count()
                       << "ms)" << std::endl;
