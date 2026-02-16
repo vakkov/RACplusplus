@@ -48,6 +48,19 @@ std::vector<long> INITIAL_NEIGHBOR_DURATIONS;
 std::vector<long> HASH_DURATIONS;
 std::vector<double> UPDATE_PERCENTAGES;
 
+#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE && \
+    defined(__AVX2__) && defined(__FMA__) && \
+    defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+static inline float hmin_ps256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 m = _mm_min_ps(lo, hi);
+    m = _mm_min_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_min_ps(m, _mm_shuffle_ps(m, m, 0x55));
+    return _mm_cvtss_f32(m);
+}
+#endif
+
 //get number of processors
 size_t getProcessorCount() {
     const auto NO_PROCESSORS = std::thread::hardware_concurrency();
@@ -616,6 +629,29 @@ void update_cluster_dissimilarities(
             nn_candidates.push_back(k);
         }
     }
+    struct IdRun {
+        int k_start;
+        size_t len;
+    };
+    std::vector<IdRun> nn_candidate_runs;
+    nn_candidate_runs.reserve(nn_candidates.size() > 0 ? nn_candidates.size() / 4 : 0);
+    if (!nn_candidates.empty()) {
+        size_t run_start = 0;
+        const size_t nn_count = nn_candidates.size();
+        for (size_t c = 1; c <= nn_count; ++c) {
+            const bool is_break =
+                (c == nn_count) ||
+                (nn_candidates[c] != nn_candidates[c - 1] + 1);
+            if (!is_break) continue;
+            nn_candidate_runs.push_back(IdRun{
+                nn_candidates[run_start],
+                c - run_start
+            });
+            run_start = c;
+        }
+    }
+    const IdRun* nn_run_data = nn_candidate_runs.data();
+    const size_t nn_run_count = nn_candidate_runs.size();
 
     // Reuse per-batch metadata buffers across sub-batches.
     std::vector<int> merge_main_ids(max_batch);
@@ -854,20 +890,22 @@ void update_cluster_dissimilarities(
         // update_cluster_nn_dist instead.
         const bool is_last_batch = (batch_end >= merge_count);
         if (is_last_batch) {
-            const int* cand_data = nn_candidates.data();
-            const size_t cand_count = nn_candidates.size();
-
             for (size_t i = 0; i < batch_size; i++) {
                 const int main_id = merge_main_ids[i];
                 const SymDistScalar* col_data = merged_columns[i].data();
                 SymDistScalar best_val = std::numeric_limits<SymDistScalar>::infinity();
                 int best_idx = -1;
 
-                for (size_t c = 0; c < cand_count; ++c) {
-                    const int k = cand_data[c];
-                    if (col_data[k] < best_val) {
-                        best_val = col_data[k];
-                        best_idx = k;
+                for (size_t r = 0; r < nn_run_count; ++r) {
+                    const int k0 = nn_run_data[r].k_start;
+                    const size_t len = nn_run_data[r].len;
+                    const SymDistScalar* seg = col_data + static_cast<size_t>(k0);
+                    for (size_t off = 0; off < len; ++off) {
+                        const SymDistScalar v = seg[off];
+                        if (v < best_val) {
+                            best_val = v;
+                            best_idx = k0 + static_cast<int>(off);
+                        }
                     }
                 }
 
@@ -1759,31 +1797,42 @@ void update_cluster_nn_dist(
         return;
     }
 
-    // Hybrid full-rescan path:
-    // when live occupancy is low, scan only alive/non-dead ids to avoid
-    // wasted distance loads and branch checks on dead entries.
-    // Keep ascending id order to preserve deterministic tie behavior.
-    std::vector<int> scan_candidates;
-    const int* scan_data = nullptr;
-    size_t scan_count = 0;
-    bool use_scan_candidates = false;
-    constexpr size_t SCAN_CANDIDATE_NUM = 3; // 75% threshold: live < 0.75 * N
-    constexpr size_t SCAN_CANDIDATE_DEN = 4;
-    if (active_indices.size() * SCAN_CANDIDATE_DEN <
-        static_cast<size_t>(N) * SCAN_CANDIDATE_NUM) {
+    // Build alive/non-dead scan runs once per iteration.
+    // Keeps scan order deterministic while removing per-element alive/dead checks
+    // from hot full-rescan paths.
+    struct ScanRun {
+        int k_start;
+        int k_end;
+        size_t len;
+    };
+    std::vector<ScanRun> scan_runs;
+    const ScanRun* scan_run_data = nullptr;
+    size_t scan_run_count = 0;
+    {
         const char* alive = is_alive_ws.data();
         const char* dead = is_dead_ws.data();
-        scan_candidates.reserve(active_indices.size());
+        scan_runs.reserve(active_indices.size() > 0 ? active_indices.size() / 4 : 0);
+        int run_start = -1;
         for (int k = 0; k < N; ++k) {
-            if (alive[k] && !dead[k]) {
-                scan_candidates.push_back(k);
+            const bool keep = alive[k] && !dead[k];
+            if (keep) {
+                if (run_start < 0) run_start = k;
+                continue;
+            }
+            if (run_start >= 0) {
+                const int k0 = run_start;
+                const int k1 = k - 1;
+                scan_runs.push_back(ScanRun{k0, k1, static_cast<size_t>(k1 - k0 + 1)});
+                run_start = -1;
             }
         }
-        scan_data = scan_candidates.data();
-        scan_count = scan_candidates.size();
-        use_scan_candidates =
-            (scan_count * SCAN_CANDIDATE_DEN <
-             static_cast<size_t>(N) * SCAN_CANDIDATE_NUM);
+        if (run_start >= 0) {
+            const int k0 = run_start;
+            const int k1 = N - 1;
+            scan_runs.push_back(ScanRun{k0, k1, static_cast<size_t>(k1 - k0 + 1)});
+        }
+        scan_run_data = scan_runs.data();
+        scan_run_count = scan_runs.size();
     }
 
     auto rescan_range = [&](size_t start, size_t end) {
@@ -1792,6 +1841,53 @@ void update_cluster_nn_dist(
         const size_t* row_start = dist.row_start.data();
         const SymDistScalar* dist_data = dist.data.data();
         const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
+        auto consider_contiguous_tail = [&](const SymDistScalar* seg,
+                                            int k_start,
+                                            size_t len,
+                                            SymDistScalar& best_val_ref,
+                                            int& best_idx_ref) {
+#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE && \
+    defined(__AVX2__) && defined(__FMA__) && \
+    defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+            SymDistScalar seg_best = inf;
+            int seg_best_off = -1;
+            size_t off = 0;
+            for (; off + 7 < len; off += 8) {
+                const __m256 v = _mm256_loadu_ps(seg + off);
+                const float block_best = hmin_ps256(v);
+                if (block_best < seg_best) {
+                    seg_best = block_best;
+                    alignas(32) float lanes[8];
+                    _mm256_store_ps(lanes, v);
+                    for (int lane = 0; lane < 8; ++lane) {
+                        if (lanes[lane] == block_best) {
+                            seg_best_off = static_cast<int>(off) + lane;
+                            break;
+                        }
+                    }
+                }
+            }
+            for (; off < len; ++off) {
+                const SymDistScalar v = seg[off];
+                if (v < seg_best) {
+                    seg_best = v;
+                    seg_best_off = static_cast<int>(off);
+                }
+            }
+            if (seg_best_off >= 0 && seg_best < best_val_ref) {
+                best_val_ref = seg_best;
+                best_idx_ref = k_start + seg_best_off;
+            }
+#else
+            for (size_t off = 0; off < len; ++off) {
+                const SymDistScalar v = seg[off];
+                if (v < best_val_ref) {
+                    best_val_ref = v;
+                    best_idx_ref = k_start + static_cast<int>(off);
+                }
+            }
+#endif
+        };
         for (size_t i = start; i < end; i++) {
             const int cluster_idx = needs_rescan[i];
             const int cid = clusters[cluster_idx].id;
@@ -1836,24 +1932,36 @@ void update_cluster_nn_dist(
             }
 
             if (!used_shortcut) {
-                if (use_scan_candidates) {
-                    const size_t cid_base = row_start[static_cast<size_t>(cid)];
-                    for (size_t c = 0; c < scan_count; ++c) {
-                        const int k = scan_data[c];
-                        if (k == cid) continue;
-                        const SymDistScalar v = (k < cid)
-                            ? dist_data[row_start[static_cast<size_t>(k)] +
-                                        static_cast<size_t>(cid - k - 1)]
-                            : dist_data[cid_base + static_cast<size_t>(k - cid - 1)];
-                        if (v < best_val) {
-                            best_val = v;
-                            best_idx = k;
+                const size_t cid_base = row_start[static_cast<size_t>(cid)];
+                const SymDistScalar* tail = dist_data + cid_base;
+                for (size_t r = 0; r < scan_run_count; ++r) {
+                    const ScanRun& run = scan_run_data[r];
+
+                    if (run.k_end < cid) {
+                        // Entire run is k < cid (scattered triangular reads).
+                        for (int k = run.k_start; k <= run.k_end; ++k) {
+                            const SymDistScalar v =
+                                dist_data[row_start[static_cast<size_t>(k)] +
+                                          static_cast<size_t>(cid - k - 1)];
+                            if (v < best_val) {
+                                best_val = v;
+                                best_idx = k;
+                            }
                         }
+                        continue;
                     }
-                } else {
-                    // k < cid: scattered upper-triangle entries
-                    for (int k = 0; k < cid; ++k) {
-                        if (!alive[k] || dead[k]) continue;
+
+                    if (run.k_start > cid) {
+                        // Entire run is k > cid (contiguous tail in cid row).
+                        const int k0 = run.k_start;
+                        const SymDistScalar* seg =
+                            tail + static_cast<size_t>(k0 - cid - 1);
+                        consider_contiguous_tail(seg, k0, run.len, best_val, best_idx);
+                        continue;
+                    }
+
+                    // Run intersects cid.
+                    for (int k = run.k_start; k < cid; ++k) {
                         const SymDistScalar v =
                             dist_data[row_start[static_cast<size_t>(k)] +
                                       static_cast<size_t>(cid - k - 1)];
@@ -1862,19 +1970,12 @@ void update_cluster_nn_dist(
                             best_idx = k;
                         }
                     }
-
-                    // k > cid: contiguous tail
-                    if (cid + 1 < N) {
-                        const size_t base = row_start[static_cast<size_t>(cid)];
-                        const SymDistScalar* tail = dist_data + base;
-                        for (int k = cid + 1; k < N; ++k) {
-                            if (!alive[k] || dead[k]) continue;
-                            const SymDistScalar v = tail[k - cid - 1];
-                            if (v < best_val) {
-                                best_val = v;
-                                best_idx = k;
-                            }
-                        }
+                    if (cid < run.k_end) {
+                        const int k0 = cid + 1;
+                        const size_t len = static_cast<size_t>(run.k_end - cid);
+                        const SymDistScalar* seg =
+                            tail + static_cast<size_t>(k0 - cid - 1);
+                        consider_contiguous_tail(seg, k0, len, best_val, best_idx);
                     }
                 }
             }
