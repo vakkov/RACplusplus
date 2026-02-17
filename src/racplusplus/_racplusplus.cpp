@@ -2159,6 +2159,8 @@ void update_cluster_nn_dist(
             }
 #endif
         };
+        std::vector<int> pending_fullscan;
+        pending_fullscan.reserve(end - start);
         for (size_t i = start; i < end; i++) {
             const int cluster_idx = needs_rescan[i];
             const int cid = clusters[cluster_idx].id;
@@ -2228,85 +2230,129 @@ void update_cluster_nn_dist(
                 }
             }
 
-            if (!used_fastpath) {
-                if (profile_ops) {
-                    ++local_fullscan_clusters;
+            if (used_fastpath) {
+                const double best_val_d = static_cast<double>(best_val);
+                clusters[cluster_idx].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
+                clusters[cluster_idx].nn_distance = best_val_d;
+            } else {
+                pending_fullscan.push_back(cluster_idx);
+            }
+        }
+
+        if (!pending_fullscan.empty()) {
+            if (profile_ops) {
+                local_fullscan_clusters += static_cast<uint64_t>(pending_fullscan.size());
+            }
+            const auto t_full_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                              : std::chrono::high_resolution_clock::time_point{};
+
+            constexpr size_t TILE_B = 32;
+            std::array<int, TILE_B> tile_cluster_idxs{};
+            std::array<int, TILE_B> tile_cids{};
+            std::array<size_t, TILE_B> tile_cid_bases{};
+            std::array<SymDistScalar, TILE_B> tile_best{};
+            std::array<int, TILE_B> tile_best_idx{};
+            const size_t pending_count = pending_fullscan.size();
+
+            for (size_t t0 = 0; t0 < pending_count; t0 += TILE_B) {
+                const size_t B = std::min(TILE_B, pending_count - t0);
+
+                for (size_t b = 0; b < B; ++b) {
+                    const int cluster_idx = pending_fullscan[t0 + b];
+                    const int cid = clusters[cluster_idx].id;
+                    tile_cluster_idxs[b] = cluster_idx;
+                    tile_cids[b] = cid;
+                    tile_cid_bases[b] = row_start[static_cast<size_t>(cid)];
+                    tile_best[b] = inf;
+                    tile_best_idx[b] = -1;
                 }
-                const auto t_full_0 = profile_ops ? std::chrono::high_resolution_clock::now()
-                                                  : std::chrono::high_resolution_clock::time_point{};
-                const size_t cid_base = row_start[static_cast<size_t>(cid)];
-                const SymDistScalar* tail = dist_data + cid_base;
+
+                const int min_cid = tile_cids[0];
+                const int max_cid = tile_cids[B - 1];
+
+                // Pass 1: k < min_cid (shared row traversal across tile).
                 for (size_t r = 0; r < scan_run_count; ++r) {
                     const ScanRun& run = scan_run_data[r];
-
-                    if (run.k_end < cid) {
-                        // Entire run is k < cid (scattered triangular reads).
-                        for (int k = run.k_start; k <= run.k_end; ++k) {
-#if defined(__GNUC__) || defined(__clang__)
-                            if (k + 4 <= run.k_end) {
-                                const int k_pf = k + 4;
-                                __builtin_prefetch(
-                                    dist_data + row_start[static_cast<size_t>(k_pf)] +
-                                    static_cast<size_t>(cid - k_pf - 1),
-                                    0, 0);
-                            }
-#endif
+                    if (run.k_start >= min_cid) break;
+                    const int k1 = std::min(run.k_end, min_cid - 1);
+                    for (int k = run.k_start; k <= k1; ++k) {
+                        const SymDistScalar* row_k =
+                            dist_data + row_start[static_cast<size_t>(k)];
+                        for (size_t b = 0; b < B; ++b) {
+                            const int cid = tile_cids[b];
                             const SymDistScalar v =
-                                dist_data[row_start[static_cast<size_t>(k)] +
-                                          static_cast<size_t>(cid - k - 1)];
-                            if (v < best_val) {
-                                best_val = v;
-                                best_idx = k;
+                                row_k[static_cast<size_t>(cid - k - 1)];
+                            if (v < tile_best[b]) {
+                                tile_best[b] = v;
+                                tile_best_idx[b] = k;
                             }
                         }
-                        continue;
                     }
+                }
 
-                    if (run.k_start > cid) {
-                        // Entire run is k > cid (contiguous tail in cid row).
-                        const int k0 = run.k_start;
-                        const SymDistScalar* seg =
-                            tail + static_cast<size_t>(k0 - cid - 1);
-                        consider_contiguous_tail(seg, k0, run.len, best_val, best_idx);
-                        continue;
-                    }
-
-                    // Run intersects cid.
-                    for (int k = run.k_start; k < cid; ++k) {
-#if defined(__GNUC__) || defined(__clang__)
-                        if (k + 4 < cid) {
-                            const int k_pf = k + 4;
-                            __builtin_prefetch(
-                                dist_data + row_start[static_cast<size_t>(k_pf)] +
-                                static_cast<size_t>(cid - k_pf - 1),
-                                0, 0);
-                        }
-#endif
-                        const SymDistScalar v =
-                            dist_data[row_start[static_cast<size_t>(k)] +
-                                      static_cast<size_t>(cid - k - 1)];
-                        if (v < best_val) {
-                            best_val = v;
-                            best_idx = k;
+                // Pass 2: min_cid <= k <= max_cid (small overlap region).
+                for (size_t r = 0; r < scan_run_count; ++r) {
+                    const ScanRun& run = scan_run_data[r];
+                    if (run.k_end < min_cid) continue;
+                    if (run.k_start > max_cid) break;
+                    const int k0 = std::max(run.k_start, min_cid);
+                    const int k1 = std::min(run.k_end, max_cid);
+                    for (int k = k0; k <= k1; ++k) {
+                        const SymDistScalar* row_k =
+                            dist_data + row_start[static_cast<size_t>(k)];
+                        for (size_t b = 0; b < B; ++b) {
+                            const int cid = tile_cids[b];
+                            if (k == cid) continue;
+                            const SymDistScalar v = (k < cid)
+                                ? row_k[static_cast<size_t>(cid - k - 1)]
+                                : dist_data[tile_cid_bases[b] +
+                                            static_cast<size_t>(k - cid - 1)];
+                            if (v < tile_best[b]) {
+                                tile_best[b] = v;
+                                tile_best_idx[b] = k;
+                            }
                         }
                     }
-                    if (cid < run.k_end) {
-                        const int k0 = cid + 1;
-                        const size_t len = static_cast<size_t>(run.k_end - cid);
+                }
+
+                // Pass 3: k > max_cid (per-cluster contiguous tails).
+                const int tail_floor = max_cid + 1;
+                for (size_t b = 0; b < B; ++b) {
+                    const int cid = tile_cids[b];
+                    SymDistScalar best_val = tile_best[b];
+                    int best_idx = tile_best_idx[b];
+                    const SymDistScalar* tail =
+                        dist_data + tile_cid_bases[b];
+
+                    for (size_t r = 0; r < scan_run_count; ++r) {
+                        const ScanRun& run = scan_run_data[r];
+                        if (run.k_end < tail_floor) continue;
+                        const int k0 = std::max(run.k_start, tail_floor);
+                        if (k0 > run.k_end) continue;
+                        const size_t len = static_cast<size_t>(run.k_end - k0 + 1);
                         const SymDistScalar* seg =
                             tail + static_cast<size_t>(k0 - cid - 1);
                         consider_contiguous_tail(seg, k0, len, best_val, best_idx);
                     }
+
+                    tile_best[b] = best_val;
+                    tile_best_idx[b] = best_idx;
                 }
-                if (profile_ops) {
-                    const auto t_full_1 = std::chrono::high_resolution_clock::now();
-                    local_fullscan_ns += ns_between(t_full_0, t_full_1);
+
+                // Store results for tile.
+                for (size_t b = 0; b < B; ++b) {
+                    const int cluster_idx = tile_cluster_idxs[b];
+                    const double best_val_d = static_cast<double>(tile_best[b]);
+                    clusters[cluster_idx].nn =
+                        (best_val_d < max_merge_distance) ? tile_best_idx[b] : -1;
+                    clusters[cluster_idx].nn_distance = best_val_d;
                 }
             }
 
-            const double best_val_d = static_cast<double>(best_val);
-            clusters[cluster_idx].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
-            clusters[cluster_idx].nn_distance = best_val_d;
+            if (profile_ops) {
+                const auto t_full_1 = std::chrono::high_resolution_clock::now();
+                local_fullscan_ns += ns_between(t_full_0, t_full_1);
+            }
         }
         if (profile_ops) {
             changed_main_fastpath_hits_accum.fetch_add(
