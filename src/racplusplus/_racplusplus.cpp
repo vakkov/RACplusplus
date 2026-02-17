@@ -837,68 +837,106 @@ void update_cluster_dissimilarities(
             g_dense_ops_profile.dissim_candidate_build_ns += ns_between(t_cand_0, t_cand_1);
         }
 
-        // Parallel column computation over live candidates only.
-        auto compute_range = [&](size_t start, size_t end) {
+        // Precompute per-merge metadata used by head/tail compute and write-back.
+        const size_t* row_start = dist.row_start.data();
+        std::vector<SymDistScalar> merge_main_weights(batch_size);
+        std::vector<SymDistScalar> merge_secondary_weights(batch_size);
+        std::vector<size_t> merge_main_bases(batch_size);
+        std::vector<size_t> merge_secondary_bases(batch_size);
+        std::vector<int> merge_cutoff_ids(batch_size);
+        for (size_t i = 0; i < batch_size; ++i) {
+            const int main_id = merge_main_ids[i];
+            const int secondary_id = merge_secondary_ids[i];
+            merge_main_weights[i] = static_cast<SymDistScalar>(
+                merge_main_sizes[i] * merge_inv_sizes[i]);
+            merge_secondary_weights[i] = static_cast<SymDistScalar>(
+                merge_secondary_sizes[i] * merge_inv_sizes[i]);
+            merge_main_bases[i] = row_start[static_cast<size_t>(main_id)];
+            merge_secondary_bases[i] = row_start[static_cast<size_t>(secondary_id)];
+            merge_cutoff_ids[i] = std::max(main_id, secondary_id);
+        }
+
+        // Sort merges by cutoff=max(main,secondary) so head row traversal can
+        // skip already-tail merges with a single advancing pointer.
+        std::vector<size_t> cutoff_order(batch_size);
+        std::iota(cutoff_order.begin(), cutoff_order.end(), static_cast<size_t>(0));
+        std::sort(cutoff_order.begin(), cutoff_order.end(),
+            [&merge_cutoff_ids](size_t a, size_t b) {
+                return merge_cutoff_ids[a] < merge_cutoff_ids[b];
+            });
+        std::vector<int> ordered_cutoffs(batch_size);
+        for (size_t p = 0; p < batch_size; ++p) {
+            ordered_cutoffs[p] = merge_cutoff_ids[cutoff_order[p]];
+        }
+        const int max_cutoff = ordered_cutoffs.empty() ? -1 : ordered_cutoffs.back();
+        const size_t head_cand_count = (max_cutoff >= 0)
+            ? static_cast<size_t>(
+                std::upper_bound(
+                    write_cand_data, write_cand_data + write_cand_count, max_cutoff) -
+                write_cand_data)
+            : 0;
+
+        // Head compute: traverse candidate rows and update all merges with k<cutoff.
+        // This improves row-cache reuse compared to scanning head per merge column.
+        auto compute_head_rows = [&](size_t start, size_t end) {
             const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
             const size_t* row_start = dist.row_start.data();
             const SymDistScalar* dist_data = dist.data.data();
+            if (start >= end) {
+                return;
+            }
 
-            for (size_t i = start; i < end; i++) {
-                const int main_id = merge_main_ids[i];
-                const int secondary_id = merge_secondary_ids[i];
-                const SymDistScalar main_weight =
-                    static_cast<SymDistScalar>(merge_main_sizes[i] * merge_inv_sizes[i]);
-                const SymDistScalar secondary_weight =
-                    static_cast<SymDistScalar>(merge_secondary_sizes[i] * merge_inv_sizes[i]);
-                SymDistVector& out_col = merged_columns[i];
-
-                const size_t main_base = row_start[static_cast<size_t>(main_id)];
-                const size_t sec_base = row_start[static_cast<size_t>(secondary_id)];
-                const int cutoff_id = std::max(main_id, secondary_id);
-                const int* tail_begin = std::upper_bound(
-                    write_cand_data, write_cand_data + write_cand_count, cutoff_id);
-                const size_t tail_start =
-                    static_cast<size_t>(tail_begin - write_cand_data);
-
-                // Head region: at least one source is scattered in triangular storage.
-                for (size_t c = 0; c < tail_start; ++c) {
-                    const int k = write_cand_data[c];
-#if defined(__GNUC__) || defined(__clang__)
-                    if (c + 4 < tail_start) {
-                        const int k_pf = write_cand_data[c + 4];
-                        if (k_pf != main_id && k_pf != secondary_id) {
-                            const SymDistScalar* main_addr_pf = (k_pf < main_id)
-                                ? (dist_data + row_start[static_cast<size_t>(k_pf)] +
-                                   static_cast<size_t>(main_id - k_pf - 1))
-                                : (dist_data + main_base +
-                                   static_cast<size_t>(k_pf - main_id - 1));
-                            const SymDistScalar* sec_addr_pf = (k_pf < secondary_id)
-                                ? (dist_data + row_start[static_cast<size_t>(k_pf)] +
-                                   static_cast<size_t>(secondary_id - k_pf - 1))
-                                : (dist_data + sec_base +
-                                   static_cast<size_t>(k_pf - secondary_id - 1));
-                            __builtin_prefetch(main_addr_pf, 0, 0);
-                            __builtin_prefetch(sec_addr_pf, 0, 0);
-                        }
-                    }
-#endif
+            size_t order_pos = static_cast<size_t>(
+                std::upper_bound(
+                    ordered_cutoffs.begin(), ordered_cutoffs.end(), write_cand_data[start]) -
+                ordered_cutoffs.begin());
+            for (size_t c = start; c < end; ++c) {
+                const int k = write_cand_data[c];
+                while (order_pos < batch_size && ordered_cutoffs[order_pos] <= k) {
+                    ++order_pos;
+                }
+                if (order_pos >= batch_size) {
+                    break;
+                }
+                const size_t row_k_base = row_start[static_cast<size_t>(k)];
+                for (size_t p = order_pos; p < batch_size; ++p) {
+                    const size_t i = cutoff_order[p];
+                    const int main_id = merge_main_ids[i];
+                    const int secondary_id = merge_secondary_ids[i];
+                    SymDistVector& out_col = merged_columns[i];
                     if (k == main_id || k == secondary_id) {
                         out_col[k] = inf;
                         continue;
                     }
 
                     const SymDistScalar d_main = (k < main_id)
-                        ? dist_data[row_start[static_cast<size_t>(k)] +
-                                    static_cast<size_t>(main_id - k - 1)]
-                        : dist_data[main_base +
-                                    static_cast<size_t>(k - main_id - 1)];
+                        ? dist_data[row_k_base + static_cast<size_t>(main_id - k - 1)]
+                        : dist_data[merge_main_bases[i] + static_cast<size_t>(k - main_id - 1)];
                     const SymDistScalar d_sec = (k < secondary_id)
-                        ? dist_data[row_start[static_cast<size_t>(k)] +
-                                    static_cast<size_t>(secondary_id - k - 1)]
-                        : dist_data[sec_base +
+                        ? dist_data[row_k_base + static_cast<size_t>(secondary_id - k - 1)]
+                        : dist_data[merge_secondary_bases[i] +
                                     static_cast<size_t>(k - secondary_id - 1)];
-                    out_col[k] = main_weight * d_main + secondary_weight * d_sec;
+                    out_col[k] = merge_main_weights[i] * d_main +
+                                 merge_secondary_weights[i] * d_sec;
                 }
+            }
+        };
+
+        // Tail compute + patching remains per-merge-column.
+        auto compute_range = [&](size_t start, size_t end) {
+            const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
+            const SymDistScalar* dist_data = dist.data.data();
+
+            for (size_t i = start; i < end; i++) {
+                const int main_id = merge_main_ids[i];
+                const int secondary_id = merge_secondary_ids[i];
+                const SymDistScalar main_weight = merge_main_weights[i];
+                const SymDistScalar secondary_weight = merge_secondary_weights[i];
+                SymDistVector& out_col = merged_columns[i];
+
+                const size_t main_base = merge_main_bases[i];
+                const size_t sec_base = merge_secondary_bases[i];
+                const int cutoff_id = merge_cutoff_ids[i];
 
                 // Tail region: k > max(main_id, secondary_id).
                 // For contiguous candidate runs, both source rows and destination are contiguous.
@@ -975,6 +1013,14 @@ void update_cluster_dissimilarities(
         size_t no_threads = std::min(requested_threads, batch_size);
         const auto t_compute_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                              : std::chrono::high_resolution_clock::time_point{};
+        const size_t head_threads = std::min(requested_threads, head_cand_count);
+        if (head_cand_count > 0) {
+            if (head_threads <= 1 || head_cand_count < 256) {
+                compute_head_rows(0, head_cand_count);
+            } else {
+                run_parallel_for(requested_threads, head_cand_count, compute_head_rows);
+            }
+        }
         if (no_threads <= 1) {
             compute_range(0, batch_size);
         } else {
@@ -986,62 +1032,85 @@ void update_cluster_dissimilarities(
         }
 
         // Write-back for merge mains:
-        // 1) parallel non-main writes per merge main (disjoint address sets)
-        // 2) deduplicated main-main writes once per pair
-        // 3) serial DSU unions
+        // 1) row-major scattered head writes across columns (k < col_id)
+        // 2) parallel contiguous tail writes per merge main (k > col_id)
+        // 3) deduplicated main-main writes once per pair
+        // 4) serial DSU unions
         const auto t_write_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                            : std::chrono::high_resolution_clock::time_point{};
-        auto set_col_active_runs = [&](int col_id, const SymDistVector& col) {
-            const size_t* row_start = dist.row_start.data();
-            const size_t col_base = row_start[static_cast<size_t>(col_id)];
-            for (size_t r = 0; r < non_main_run_count; ++r) {
+        SymDistScalar* dist_data = dist.data.data();
+
+        std::vector<size_t> main_id_order(batch_size);
+        std::iota(main_id_order.begin(), main_id_order.end(), static_cast<size_t>(0));
+        std::sort(main_id_order.begin(), main_id_order.end(),
+            [&merge_main_ids](size_t a, size_t b) {
+                return merge_main_ids[a] < merge_main_ids[b];
+            });
+        std::vector<int> sorted_main_ids(batch_size);
+        for (size_t p = 0; p < batch_size; ++p) {
+            sorted_main_ids[p] = merge_main_ids[main_id_order[p]];
+        }
+
+        // Scatter region k<col_id: process rows in order so writes for each row are contiguous.
+        auto write_non_main_head_rows = [&](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
                 const CandidateRun& run = non_main_run_data[r];
-                if (run.k_end < col_id) {
-                    for (int k = run.k_start; k <= run.k_end; ++k) {
-                        const size_t idx =
-                            row_start[static_cast<size_t>(k)] +
-                            static_cast<size_t>(col_id - k - 1);
-                        dist.data[idx] = col[k];
+                size_t col_pos = 0;
+                while (col_pos < batch_size && sorted_main_ids[col_pos] <= run.k_start) {
+                    ++col_pos;
+                }
+                for (int k = run.k_start; k <= run.k_end; ++k) {
+                    while (col_pos < batch_size && sorted_main_ids[col_pos] <= k) {
+                        ++col_pos;
                     }
-                    continue;
+                    if (col_pos >= batch_size) {
+                        break;
+                    }
+                    SymDistScalar* row_ptr = dist_data + row_start[static_cast<size_t>(k)];
+                    for (size_t p = col_pos; p < batch_size; ++p) {
+                        const int col_id = sorted_main_ids[p];
+                        const size_t merge_idx = main_id_order[p];
+                        row_ptr[static_cast<size_t>(col_id - k - 1)] =
+                            merged_columns[merge_idx][k];
+                    }
                 }
+            }
+        };
+        const size_t head_write_threads = std::min(requested_threads, non_main_run_count);
+        if (head_write_threads <= 1 || non_main_run_count < 8) {
+            write_non_main_head_rows(0, non_main_run_count);
+        } else {
+            run_parallel_for(requested_threads, non_main_run_count, write_non_main_head_rows);
+        }
 
-                if (run.k_start > col_id) {
-                    const int k0 = run.k_start;
+        // Contiguous region k>col_id: keep per-column writes (fast memcpy-like paths).
+        auto write_non_main_tail_range = [&](size_t start, size_t end) {
+            for (size_t i = start; i < end; ++i) {
+                const int col_id = merge_main_ids[i];
+                const size_t col_base = row_start[static_cast<size_t>(col_id)];
+                const SymDistScalar* col_ptr = merged_columns[i].data();
+                for (size_t r = 0; r < non_main_run_count; ++r) {
+                    const CandidateRun& run = non_main_run_data[r];
+                    if (run.k_end <= col_id) {
+                        continue;
+                    }
+                    const int k0 = std::max(run.k_start, col_id + 1);
+                    if (k0 > run.k_end) {
+                        continue;
+                    }
+                    const size_t len = static_cast<size_t>(run.k_end - k0 + 1);
                     SymDistScalar* dst =
-                        dist.data.data() + col_base + static_cast<size_t>(k0 - col_id - 1);
-                    const SymDistScalar* src = col.data() + static_cast<size_t>(k0);
-                    std::copy_n(src, run.len, dst);
-                    continue;
-                }
-
-                // Run intersects col_id: write left scattered and right contiguous.
-                for (int k = run.k_start; k < col_id; ++k) {
-                    const size_t idx =
-                        row_start[static_cast<size_t>(k)] +
-                        static_cast<size_t>(col_id - k - 1);
-                    dist.data[idx] = col[k];
-                }
-                if (col_id < run.k_end) {
-                    const int k0 = col_id + 1;
-                    const size_t len = static_cast<size_t>(run.k_end - col_id);
-                    SymDistScalar* dst =
-                        dist.data.data() + col_base + static_cast<size_t>(k0 - col_id - 1);
-                    const SymDistScalar* src = col.data() + static_cast<size_t>(k0);
+                        dist_data + col_base + static_cast<size_t>(k0 - col_id - 1);
+                    const SymDistScalar* src = col_ptr + static_cast<size_t>(k0);
                     std::copy_n(src, len, dst);
                 }
             }
         };
-        auto write_non_main_range = [&](size_t start, size_t end) {
-            for (size_t i = start; i < end; ++i) {
-                set_col_active_runs(merge_main_ids[i], merged_columns[i]);
-            }
-        };
         const size_t write_threads = std::min(requested_threads, batch_size);
         if (write_threads <= 1 || batch_size < 64) {
-            write_non_main_range(0, batch_size);
+            write_non_main_tail_range(0, batch_size);
         } else {
-            run_parallel_for(requested_threads, batch_size, write_non_main_range);
+            run_parallel_for(requested_threads, batch_size, write_non_main_tail_range);
         }
 
         // Main-main pairs are duplicated across columns; write each pair once.
