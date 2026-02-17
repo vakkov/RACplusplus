@@ -863,6 +863,25 @@ void update_cluster_dissimilarities(
                 // Head region: at least one source is scattered in triangular storage.
                 for (size_t c = 0; c < tail_start; ++c) {
                     const int k = write_cand_data[c];
+#if defined(__GNUC__) || defined(__clang__)
+                    if (c + 4 < tail_start) {
+                        const int k_pf = write_cand_data[c + 4];
+                        if (k_pf != main_id && k_pf != secondary_id) {
+                            const SymDistScalar* main_addr_pf = (k_pf < main_id)
+                                ? (dist_data + row_start[static_cast<size_t>(k_pf)] +
+                                   static_cast<size_t>(main_id - k_pf - 1))
+                                : (dist_data + main_base +
+                                   static_cast<size_t>(k_pf - main_id - 1));
+                            const SymDistScalar* sec_addr_pf = (k_pf < secondary_id)
+                                ? (dist_data + row_start[static_cast<size_t>(k_pf)] +
+                                   static_cast<size_t>(secondary_id - k_pf - 1))
+                                : (dist_data + sec_base +
+                                   static_cast<size_t>(k_pf - secondary_id - 1));
+                            __builtin_prefetch(main_addr_pf, 0, 0);
+                            __builtin_prefetch(sec_addr_pf, 0, 0);
+                        }
+                    }
+#endif
                     if (k == main_id || k == secondary_id) {
                         out_col[k] = inf;
                         continue;
@@ -2029,6 +2048,8 @@ void update_cluster_nn_dist(
         }
         return;
     }
+    std::sort(needs_rescan.begin(), needs_rescan.end(),
+        [&clusters](int a, int b) { return clusters[a].id < clusters[b].id; });
 
     // Build alive/non-dead scan runs once per iteration.
     // Keeps scan order deterministic while removing per-element alive/dead checks
@@ -2221,6 +2242,15 @@ void update_cluster_nn_dist(
                     if (run.k_end < cid) {
                         // Entire run is k < cid (scattered triangular reads).
                         for (int k = run.k_start; k <= run.k_end; ++k) {
+#if defined(__GNUC__) || defined(__clang__)
+                            if (k + 4 <= run.k_end) {
+                                const int k_pf = k + 4;
+                                __builtin_prefetch(
+                                    dist_data + row_start[static_cast<size_t>(k_pf)] +
+                                    static_cast<size_t>(cid - k_pf - 1),
+                                    0, 0);
+                            }
+#endif
                             const SymDistScalar v =
                                 dist_data[row_start[static_cast<size_t>(k)] +
                                           static_cast<size_t>(cid - k - 1)];
@@ -2243,6 +2273,15 @@ void update_cluster_nn_dist(
 
                     // Run intersects cid.
                     for (int k = run.k_start; k < cid; ++k) {
+#if defined(__GNUC__) || defined(__clang__)
+                        if (k + 4 < cid) {
+                            const int k_pf = k + 4;
+                            __builtin_prefetch(
+                                dist_data + row_start[static_cast<size_t>(k_pf)] +
+                                static_cast<size_t>(cid - k_pf - 1),
+                                0, 0);
+                        }
+#endif
                         const SymDistScalar v =
                             dist_data[row_start[static_cast<size_t>(k)] +
                                       static_cast<size_t>(cid - k - 1)];
