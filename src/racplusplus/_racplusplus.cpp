@@ -32,7 +32,8 @@ namespace py = pybind11;
 #include <numeric>
 #include <cmath>
 #include <cstdlib>
-#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE
+#if (defined(RACPP_SIMD_DISSIM_TAIL_UPDATE) && RACPP_SIMD_DISSIM_TAIL_UPDATE) || \
+    (defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE)
 #include <immintrin.h>
 #endif
 
@@ -54,15 +55,14 @@ struct DenseOpsProfile {
     long long dissim_candidate_build_ns = 0;
     long long dissim_compute_ns = 0;
     long long dissim_writeback_ns = 0;
-    long long dissim_last_batch_nn_ns = 0;
-    long long nn_changed_shortlist_prep_ns = 0;
+    long long dissim_batch_nn_ns = 0;
     long long nn_scan_run_build_ns = 0;
     long long nn_rescan_total_ns = 0;
-    long long nn_shortlist_eval_ns = 0;
+    long long nn_changed_main_fastpath_ns = 0;
     long long nn_fullscan_eval_ns = 0;
     uint64_t nn_rescan_clusters = 0;
-    uint64_t nn_shortlist_attempts = 0;
-    uint64_t nn_shortlist_hits = 0;
+    uint64_t nn_changed_main_fastpath_hits = 0;
+    uint64_t nn_changed_main_fallbacks = 0;
     uint64_t nn_fullscan_clusters = 0;
 
     void reset() { *this = DenseOpsProfile{}; }
@@ -89,7 +89,7 @@ static inline double ns_to_ms(long long ns) {
     return static_cast<double>(ns) / 1e6;
 }
 
-#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE && \
+#if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
     defined(__AVX2__) && defined(__FMA__) && \
     defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
 static inline float hmin_ps256(__m256 v) {
@@ -913,7 +913,7 @@ void update_cluster_dissimilarities(
                         dist_data + sec_base + static_cast<size_t>(k0 - secondary_id - 1);
                     SymDistScalar* out_ptr = out_col.data() + static_cast<size_t>(k0);
 
-#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE && \
+#if defined(RACPP_SIMD_DISSIM_TAIL_UPDATE) && RACPP_SIMD_DISSIM_TAIL_UPDATE && \
     defined(__AVX2__) && defined(__FMA__) && \
     defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
                     size_t off = 0;
@@ -1064,24 +1064,56 @@ void update_cluster_dissimilarities(
             is_processed_secondary[static_cast<size_t>(sid)] = 1;
             is_batch_main[static_cast<size_t>(merge_main_ids[i])] = 0;
         }
-        // ITEM 6: Compute NN for merge mains from contiguous merged_columns,
-        // but ONLY for the last batch. Earlier batches' mains get stale NNs
-        // because later batches modify distances — those are handled by
-        // update_cluster_nn_dist instead.
-        const bool is_last_batch = (batch_end >= merge_count);
-        if (is_last_batch) {
-            const auto t_last_nn_0 = profile_ops ? std::chrono::high_resolution_clock::now()
-                                                 : std::chrono::high_resolution_clock::time_point{};
-            for (size_t i = 0; i < batch_size; i++) {
+        // Compute tentative NN for merge mains from contiguous merged_columns
+        // for every batch. update_cluster_nn_dist validates changed=1 mains
+        // against later-batch mains and falls back to full scan when needed.
+        const auto t_batch_nn_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                              : std::chrono::high_resolution_clock::time_point{};
+        auto batch_nn_range = [&](size_t start, size_t end) {
+            const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
+            for (size_t i = start; i < end; i++) {
                 const int main_id = merge_main_ids[i];
                 const SymDistScalar* col_data = merged_columns[i].data();
-                SymDistScalar best_val = std::numeric_limits<SymDistScalar>::infinity();
+                SymDistScalar best_val = inf;
                 int best_idx = -1;
 
                 for (size_t r = 0; r < nn_run_count; ++r) {
                     const int k0 = nn_run_data[r].k_start;
                     const size_t len = nn_run_data[r].len;
                     const SymDistScalar* seg = col_data + static_cast<size_t>(k0);
+#if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
+    defined(__AVX2__) && defined(__FMA__) && \
+    defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+                    SymDistScalar seg_best = inf;
+                    int seg_best_off = -1;
+                    size_t off = 0;
+                    for (; off + 7 < len; off += 8) {
+                        const __m256 v = _mm256_loadu_ps(seg + off);
+                        const float block_best = hmin_ps256(v);
+                        if (block_best < seg_best) {
+                            seg_best = block_best;
+                            alignas(32) float lanes[8];
+                            _mm256_store_ps(lanes, v);
+                            for (int lane = 0; lane < 8; ++lane) {
+                                if (lanes[lane] == block_best) {
+                                    seg_best_off = static_cast<int>(off) + lane;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    for (; off < len; ++off) {
+                        const SymDistScalar v = seg[off];
+                        if (v < seg_best) {
+                            seg_best = v;
+                            seg_best_off = static_cast<int>(off);
+                        }
+                    }
+                    if (seg_best_off >= 0 && seg_best < best_val) {
+                        best_val = seg_best;
+                        best_idx = k0 + seg_best_off;
+                    }
+#else
                     for (size_t off = 0; off < len; ++off) {
                         const SymDistScalar v = seg[off];
                         if (v < best_val) {
@@ -1089,17 +1121,24 @@ void update_cluster_dissimilarities(
                             best_idx = k0 + static_cast<int>(off);
                         }
                     }
+#endif
                 }
 
                 const double best_val_d = static_cast<double>(best_val);
                 clusters[main_id].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
                 clusters[main_id].nn_distance = best_val_d;
             }
-            if (profile_ops) {
-                const auto t_last_nn_1 = std::chrono::high_resolution_clock::now();
-                g_dense_ops_profile.dissim_last_batch_nn_ns +=
-                    ns_between(t_last_nn_0, t_last_nn_1);
-            }
+        };
+        const size_t batch_nn_threads = std::min(requested_threads, batch_size);
+        if (batch_nn_threads <= 1 || batch_size < 64) {
+            batch_nn_range(0, batch_size);
+        } else {
+            run_parallel_for(requested_threads, batch_size, batch_nn_range);
+        }
+        if (profile_ops) {
+            const auto t_batch_nn_1 = std::chrono::high_resolution_clock::now();
+            g_dense_ops_profile.dissim_batch_nn_ns +=
+                ns_between(t_batch_nn_0, t_batch_nn_1);
         }
     }
 
@@ -1947,69 +1986,20 @@ void update_cluster_nn_dist(
         is_changed_ws[merges[i].first] = 2;
     }
 
+    // Map merge main id -> merge batch index.
+    // Needed to validate changed=1 mains against only later-batch mains.
+    std::vector<int> main_to_batch(static_cast<size_t>(N), -1);
     std::vector<int> changed_main_ids;
     changed_main_ids.reserve(merges.size());
-    for (const auto& m : merges) {
-        changed_main_ids.push_back(m.first);
+    for (size_t i = 0; i < merges.size(); ++i) {
+        const int mid = merges[i].first;
+        main_to_batch[static_cast<size_t>(mid)] = static_cast<int>(i / MERGE_BATCH);
+        changed_main_ids.push_back(mid);
     }
-    constexpr size_t MAX_CHANGED_MAIN_SHORTLIST = 2048;
-    constexpr uint64_t SHORTLIST_DISABLE_MIN_ATTEMPTS = 50000;
-    constexpr double SHORTLIST_DISABLE_MIN_HIT_RATE = 1e-3; // 0.1%
-    static std::atomic<uint64_t> s_shortlist_attempts_total{0};
-    static std::atomic<uint64_t> s_shortlist_hits_total{0};
-    static std::atomic<int> s_shortlist_disabled{0};
-    const bool shortlist_globally_disabled =
-        (s_shortlist_disabled.load(std::memory_order_relaxed) != 0);
-    bool use_changed_shortlist =
-        !shortlist_globally_disabled &&
-        (changed_main_ids.size() <= MAX_CHANGED_MAIN_SHORTLIST);
-    struct ChangedMainRun {
-        int k_start;
-        int k_end;
-        size_t len;
-    };
-    std::vector<ChangedMainRun> changed_main_runs;
-    const ChangedMainRun* changed_run_data = nullptr;
-    size_t changed_run_count = 0;
-    const auto t_changed_prep_0 = profile_ops ? std::chrono::high_resolution_clock::now()
-                                              : std::chrono::high_resolution_clock::time_point{};
-    if (use_changed_shortlist) {
-        std::vector<int> changed_main_live;
-        changed_main_live.reserve(changed_main_ids.size());
-        for (int k : changed_main_ids) {
-            if (is_alive_ws[k] && !is_dead_ws[k]) {
-                changed_main_live.push_back(k);
-            }
-        }
-        std::sort(changed_main_live.begin(), changed_main_live.end());
-        changed_main_live.erase(
-            std::unique(changed_main_live.begin(), changed_main_live.end()),
-            changed_main_live.end());
-        changed_main_runs.reserve(
-            changed_main_live.size() > 0 ? changed_main_live.size() / 4 : 0);
-        if (!changed_main_live.empty()) {
-            size_t run_start = 0;
-            const size_t count = changed_main_live.size();
-            for (size_t c = 1; c <= count; ++c) {
-                const bool is_break =
-                    (c == count) ||
-                    (changed_main_live[c] != changed_main_live[c - 1] + 1);
-                if (!is_break) continue;
-                const int k0 = changed_main_live[run_start];
-                const int k1 = changed_main_live[c - 1];
-                changed_main_runs.push_back(
-                    ChangedMainRun{k0, k1, c - run_start});
-                run_start = c;
-            }
-        }
-        changed_run_data = changed_main_runs.data();
-        changed_run_count = changed_main_runs.size();
-    }
-    if (profile_ops) {
-        const auto t_changed_prep_1 = std::chrono::high_resolution_clock::now();
-        g_dense_ops_profile.nn_changed_shortlist_prep_ns +=
-            ns_between(t_changed_prep_0, t_changed_prep_1);
-    }
+    std::sort(changed_main_ids.begin(), changed_main_ids.end());
+    changed_main_ids.erase(
+        std::unique(changed_main_ids.begin(), changed_main_ids.end()),
+        changed_main_ids.end());
 
     std::vector<int> needs_rescan;
     needs_rescan.reserve(active_indices.size());
@@ -2084,28 +2074,29 @@ void update_cluster_nn_dist(
         g_dense_ops_profile.nn_scan_run_build_ns += ns_between(t_scanrun_0, t_scanrun_1);
     }
 
-    std::atomic<uint64_t> shortlist_attempts_accum{0};
-    std::atomic<uint64_t> shortlist_hits_accum{0};
+    std::atomic<uint64_t> changed_main_fastpath_hits_accum{0};
+    std::atomic<uint64_t> changed_main_fallbacks_accum{0};
     std::atomic<uint64_t> fullscan_clusters_accum{0};
-    std::atomic<long long> shortlist_ns_accum{0};
+    std::atomic<long long> changed_main_fastpath_ns_accum{0};
     std::atomic<long long> fullscan_ns_accum{0};
 
     auto rescan_range = [&](size_t start, size_t end) {
+        const char* alive = is_alive_ws.data();
         const char* dead = is_dead_ws.data();
         const size_t* row_start = dist.row_start.data();
         const SymDistScalar* dist_data = dist.data.data();
         const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
-        uint64_t local_shortlist_attempts = 0;
-        uint64_t local_shortlist_hits = 0;
+        uint64_t local_changed_main_fastpath_hits = 0;
+        uint64_t local_changed_main_fallbacks = 0;
         uint64_t local_fullscan_clusters = 0;
-        long long local_shortlist_ns = 0;
+        long long local_changed_main_fastpath_ns = 0;
         long long local_fullscan_ns = 0;
         auto consider_contiguous_tail = [&](const SymDistScalar* seg,
                                             int k_start,
                                             size_t len,
                                             SymDistScalar& best_val_ref,
                                             int& best_idx_ref) {
-#if defined(RACPP_SIMD_TAIL_UPDATE) && RACPP_SIMD_TAIL_UPDATE && \
+#if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
     defined(__AVX2__) && defined(__FMA__) && \
     defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
             SymDistScalar seg_best = inf;
@@ -2152,89 +2143,71 @@ void update_cluster_nn_dist(
             const int cid = clusters[cluster_idx].id;
             SymDistScalar best_val = inf;
             int best_idx = -1;
-            bool used_shortcut = false;
+            bool used_fastpath = false;
 
-            const int old_nn = clusters[cluster_idx].nn;
-            const SymDistScalar old_nn_dist =
-                static_cast<SymDistScalar>(clusters[cluster_idx].nn_distance);
-            const bool nn_invalidated =
-                (old_nn != -1) &&
-                (dead[old_nn] || is_changed_ws[old_nn]);
-            if (use_changed_shortlist &&
-                nn_invalidated &&
-                old_nn_dist < inf) {
-                ++local_shortlist_attempts;
-                const auto t_short_0 = profile_ops ? std::chrono::high_resolution_clock::now()
-                                                   : std::chrono::high_resolution_clock::time_point{};
+            // changed=1 means this main was merged in an earlier sub-batch.
+            // Its tentative NN is already computed from merged_columns.
+            // Validate it against later-batch mains only, and full-rescan
+            // only when that tentative NN is not safe to reuse.
+            if (is_changed_ws[cid] == 1) {
+                const int my_batch = main_to_batch[static_cast<size_t>(cid)];
+                const int tentative_nn = clusters[cluster_idx].nn;
+                const SymDistScalar tentative_dist =
+                    static_cast<SymDistScalar>(clusters[cluster_idx].nn_distance);
 
-                SymDistScalar changed_best = inf;
-                int changed_best_idx = -1;
-                const size_t cid_base = row_start[static_cast<size_t>(cid)];
-                const SymDistScalar* cid_tail = dist_data + cid_base;
-
-                for (size_t r = 0; r < changed_run_count; ++r) {
-                    const ChangedMainRun& run = changed_run_data[r];
-
-                    if (run.k_end < cid) {
-                        for (int k = run.k_start; k <= run.k_end; ++k) {
-                            const SymDistScalar v =
-                                dist_data[row_start[static_cast<size_t>(k)] +
-                                          static_cast<size_t>(cid - k - 1)];
-                            if (v < changed_best ||
-                                (v == changed_best &&
-                                 (changed_best_idx == -1 || k < changed_best_idx))) {
-                                changed_best = v;
-                                changed_best_idx = k;
-                            }
-                        }
-                        continue;
-                    }
-
-                    if (run.k_start > cid) {
-                        const SymDistScalar* seg =
-                            cid_tail + static_cast<size_t>(run.k_start - cid - 1);
-                        consider_contiguous_tail(
-                            seg, run.k_start, run.len, changed_best, changed_best_idx);
-                        continue;
-                    }
-
-                    // Run intersects cid.
-                    for (int k = run.k_start; k < cid; ++k) {
-                        const SymDistScalar v =
-                            dist_data[row_start[static_cast<size_t>(k)] +
-                                      static_cast<size_t>(cid - k - 1)];
-                        if (v < changed_best ||
-                            (v == changed_best &&
-                             (changed_best_idx == -1 || k < changed_best_idx))) {
-                            changed_best = v;
-                            changed_best_idx = k;
-                        }
-                    }
-                    if (cid < run.k_end) {
-                        const int k0 = cid + 1;
-                        const size_t len = static_cast<size_t>(run.k_end - cid);
-                        const SymDistScalar* seg =
-                            cid_tail + static_cast<size_t>(k0 - cid - 1);
-                        consider_contiguous_tail(
-                            seg, k0, len, changed_best, changed_best_idx);
+                bool can_use_tentative =
+                    (my_batch >= 0) &&
+                    (tentative_nn != -1) &&
+                    alive[tentative_nn] &&
+                    !dead[tentative_nn];
+                if (can_use_tentative) {
+                    const int tentative_batch =
+                        main_to_batch[static_cast<size_t>(tentative_nn)];
+                    // Tentative target from a later batch may have changed value.
+                    if (tentative_batch != -1 && tentative_batch > my_batch) {
+                        can_use_tentative = false;
                     }
                 }
-                if (profile_ops) {
-                    const auto t_short_1 = std::chrono::high_resolution_clock::now();
-                    local_shortlist_ns += ns_between(t_short_0, t_short_1);
-                }
 
-                // Safe skip of full scan: changed set produced a strictly better NN than
-                // previous best distance. Unchanged distances did not change in this round.
-                if (changed_best < old_nn_dist) {
-                    best_val = changed_best;
-                    best_idx = changed_best_idx;
-                    used_shortcut = true;
-                    ++local_shortlist_hits;
+                if (can_use_tentative) {
+                    const auto t_fast_0 = profile_ops ? std::chrono::high_resolution_clock::now()
+                                                      : std::chrono::high_resolution_clock::time_point{};
+                    best_val = tentative_dist;
+                    best_idx = tentative_nn;
+                    const size_t cid_base = row_start[static_cast<size_t>(cid)];
+
+                    for (int k : changed_main_ids) {
+                        if (k == cid || !alive[k] || dead[k]) continue;
+                        const int k_batch = main_to_batch[static_cast<size_t>(k)];
+                        if (k_batch <= my_batch) continue;  // only later-batch mains
+
+                        const SymDistScalar v = (k < cid)
+                            ? dist_data[row_start[static_cast<size_t>(k)] +
+                                        static_cast<size_t>(cid - k - 1)]
+                            : dist_data[cid_base +
+                                        static_cast<size_t>(k - cid - 1)];
+                        if (v < best_val ||
+                            (v == best_val && (best_idx == -1 || k < best_idx))) {
+                            best_val = v;
+                            best_idx = k;
+                        }
+                    }
+                    used_fastpath = true;
+                    if (profile_ops) {
+                        ++local_changed_main_fastpath_hits;
+                    }
+                    if (profile_ops) {
+                        const auto t_fast_1 = std::chrono::high_resolution_clock::now();
+                        local_changed_main_fastpath_ns += ns_between(t_fast_0, t_fast_1);
+                    }
+                } else {
+                    if (profile_ops) {
+                        ++local_changed_main_fallbacks;
+                    }
                 }
             }
 
-            if (!used_shortcut) {
+            if (!used_fastpath) {
                 if (profile_ops) {
                     ++local_fullscan_clusters;
                 }
@@ -2296,11 +2269,16 @@ void update_cluster_nn_dist(
             clusters[cluster_idx].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
             clusters[cluster_idx].nn_distance = best_val_d;
         }
-        shortlist_attempts_accum.fetch_add(local_shortlist_attempts, std::memory_order_relaxed);
-        shortlist_hits_accum.fetch_add(local_shortlist_hits, std::memory_order_relaxed);
-        fullscan_clusters_accum.fetch_add(local_fullscan_clusters, std::memory_order_relaxed);
         if (profile_ops) {
-            shortlist_ns_accum.fetch_add(local_shortlist_ns, std::memory_order_relaxed);
+            changed_main_fastpath_hits_accum.fetch_add(
+                local_changed_main_fastpath_hits, std::memory_order_relaxed);
+            changed_main_fallbacks_accum.fetch_add(
+                local_changed_main_fallbacks, std::memory_order_relaxed);
+        }
+        if (profile_ops) {
+            fullscan_clusters_accum.fetch_add(local_fullscan_clusters, std::memory_order_relaxed);
+            changed_main_fastpath_ns_accum.fetch_add(
+                local_changed_main_fastpath_ns, std::memory_order_relaxed);
             fullscan_ns_accum.fetch_add(local_fullscan_ns, std::memory_order_relaxed);
         }
     };
@@ -2315,37 +2293,18 @@ void update_cluster_nn_dist(
     } else {
         run_parallel_for(requested, count, rescan_range);
     }
-    const uint64_t call_shortlist_attempts =
-        shortlist_attempts_accum.load(std::memory_order_relaxed);
-    const uint64_t call_shortlist_hits =
-        shortlist_hits_accum.load(std::memory_order_relaxed);
-    if (call_shortlist_attempts > 0) {
-        const uint64_t total_attempts =
-            s_shortlist_attempts_total.fetch_add(call_shortlist_attempts, std::memory_order_relaxed) +
-            call_shortlist_attempts;
-        const uint64_t total_hits =
-            s_shortlist_hits_total.fetch_add(call_shortlist_hits, std::memory_order_relaxed) +
-            call_shortlist_hits;
-        if (total_attempts >= SHORTLIST_DISABLE_MIN_ATTEMPTS) {
-            const double hit_rate =
-                static_cast<double>(total_hits) / static_cast<double>(total_attempts);
-            if (hit_rate < SHORTLIST_DISABLE_MIN_HIT_RATE) {
-                s_shortlist_disabled.store(1, std::memory_order_relaxed);
-            }
-        }
-    }
     if (profile_ops) {
         const auto t_rescan_total_1 = std::chrono::high_resolution_clock::now();
         g_dense_ops_profile.nn_rescan_total_ns += ns_between(t_rescan_total_0, t_rescan_total_1);
         g_dense_ops_profile.nn_rescan_clusters += static_cast<uint64_t>(count);
-        g_dense_ops_profile.nn_shortlist_attempts +=
-            shortlist_attempts_accum.load(std::memory_order_relaxed);
-        g_dense_ops_profile.nn_shortlist_hits +=
-            shortlist_hits_accum.load(std::memory_order_relaxed);
+        g_dense_ops_profile.nn_changed_main_fastpath_hits +=
+            changed_main_fastpath_hits_accum.load(std::memory_order_relaxed);
+        g_dense_ops_profile.nn_changed_main_fallbacks +=
+            changed_main_fallbacks_accum.load(std::memory_order_relaxed);
         g_dense_ops_profile.nn_fullscan_clusters +=
             fullscan_clusters_accum.load(std::memory_order_relaxed);
-        g_dense_ops_profile.nn_shortlist_eval_ns +=
-            shortlist_ns_accum.load(std::memory_order_relaxed);
+        g_dense_ops_profile.nn_changed_main_fastpath_ns +=
+            changed_main_fastpath_ns_accum.load(std::memory_order_relaxed);
         g_dense_ops_profile.nn_fullscan_eval_ns +=
             fullscan_ns_accum.load(std::memory_order_relaxed);
     }
@@ -2703,17 +2662,19 @@ void RAC_i(
                   << " | cand_build=" << ns_to_ms(g_dense_ops_profile.dissim_candidate_build_ns) << "ms"
                   << " | compute=" << ns_to_ms(g_dense_ops_profile.dissim_compute_ns) << "ms"
                   << " | writeback=" << ns_to_ms(g_dense_ops_profile.dissim_writeback_ns) << "ms"
-                  << " | last_batch_nn=" << ns_to_ms(g_dense_ops_profile.dissim_last_batch_nn_ns) << "ms"
+                  << " | batch_nn=" << ns_to_ms(g_dense_ops_profile.dissim_batch_nn_ns) << "ms"
                   << std::endl;
-        std::cerr << "RAC profile (nn_dist): shortlist_prep="
-                  << ns_to_ms(g_dense_ops_profile.nn_changed_shortlist_prep_ns) << "ms"
-                  << " | scan_run_build=" << ns_to_ms(g_dense_ops_profile.nn_scan_run_build_ns) << "ms"
+        std::cerr << "RAC profile (nn_dist): scan_run_build="
+                  << ns_to_ms(g_dense_ops_profile.nn_scan_run_build_ns) << "ms"
                   << " | rescan_total=" << ns_to_ms(g_dense_ops_profile.nn_rescan_total_ns) << "ms"
-                  << " | shortlist_eval=" << ns_to_ms(g_dense_ops_profile.nn_shortlist_eval_ns) << "ms"
+                  << " | changed_main_fastpath="
+                  << ns_to_ms(g_dense_ops_profile.nn_changed_main_fastpath_ns) << "ms"
                   << " | fullscan_eval=" << ns_to_ms(g_dense_ops_profile.nn_fullscan_eval_ns) << "ms"
                   << " | rescans=" << g_dense_ops_profile.nn_rescan_clusters
-                  << " | shortlist_attempts=" << g_dense_ops_profile.nn_shortlist_attempts
-                  << " | shortlist_hits=" << g_dense_ops_profile.nn_shortlist_hits
+                  << " | changed_main_fastpath_hits="
+                  << g_dense_ops_profile.nn_changed_main_fastpath_hits
+                  << " | changed_main_fallbacks="
+                  << g_dense_ops_profile.nn_changed_main_fallbacks
                   << " | fullscan_clusters=" << g_dense_ops_profile.nn_fullscan_clusters
                   << std::endl;
     }
