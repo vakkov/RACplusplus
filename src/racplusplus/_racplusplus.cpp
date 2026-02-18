@@ -2690,8 +2690,8 @@ void RAC_i(
         const size_t curr_n = static_cast<size_t>(dist.N);
         constexpr size_t MIN_COMPACT_ACTIVE = 64;
         constexpr size_t MIN_COMPACT_N = 8192;
-        constexpr size_t MIN_COMPACT_DROP = 2048;
-        constexpr int MAX_COMPACTIONS = 4;
+        constexpr size_t MIN_COMPACT_DROP = 4096;
+        constexpr int MAX_COMPACTIONS = 2;
         const bool should_compact =
             active_count > MIN_COMPACT_ACTIVE &&
             curr_n >= MIN_COMPACT_N &&
@@ -2723,16 +2723,26 @@ void RAC_i(
             }
 
             // Build compact distance matrix (parallel by row).
+            // Direct data access: sorted_active is sorted so oi < oj always,
+            // avoiding dist.get()'s equality check + conditional swap per element.
             SymDistMatrix new_dist(A);
             {
+                const SymDistScalar* old_data = dist.data.data();
+                const size_t* old_row_start = dist.row_start.data();
+                SymDistScalar* new_data = new_dist.data.data();
+                const size_t* new_row_start = new_dist.row_start.data();
+                const int* sa = sorted_active.data();
+
                 auto copy_range = [&](size_t start, size_t end) {
                     for (size_t i = start; i < end; i++) {
-                        const int ii = static_cast<int>(i);
-                        const int oi = sorted_active[ii];
-                        for (int j = ii + 1; j < A; j++) {
-                            new_dist.data[new_dist.tri_idx(ii, j)] =
-                                static_cast<SymDistScalar>(
-                                    dist.get(oi, sorted_active[j]));
+                        const int oi = sa[i];
+                        const size_t old_base = old_row_start[static_cast<size_t>(oi)];
+                        const size_t new_base = new_row_start[i];
+                        for (size_t j = i + 1; j < static_cast<size_t>(A); j++) {
+                            const int oj = sa[j];
+                            // oi < oj guaranteed (sorted_active is sorted)
+                            new_data[new_base + (j - i - 1)] =
+                                old_data[old_base + static_cast<size_t>(oj - oi - 1)];
                         }
                     }
                 };
