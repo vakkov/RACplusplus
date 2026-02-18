@@ -952,7 +952,7 @@ void update_cluster_dissimilarities(
         // Tail compute + patching remains per-merge-column.
         auto compute_range = [&](size_t start, size_t end) {
             const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
-            const SymDistScalar* dist_data = dist.data.data();
+            SymDistScalar* dist_data = dist.data.data();
 
             for (size_t i = start; i < end; i++) {
                 const int main_id = merge_main_ids[i];
@@ -968,36 +968,27 @@ void update_cluster_dissimilarities(
                 const int cutoff_id = merge_cutoff_ids[i];
 
                 // Tail region: k > max(main_id, secondary_id).
-                // For contiguous candidate runs, both source rows and destination are contiguous.
-                // Runs are precomputed once per sub-batch to avoid per-merge run detection cost.
+                // Fuse compute + writeback by storing directly into dist row(main_id,*)
+                // for non-main rows only. This removes a later tail copy pass.
                 size_t run_idx = 0;
-                size_t lo = 0, hi = run_count;
-                while (lo < hi) {
-                    const size_t mid = lo + (hi - lo) / 2;
-                    if (run_data[mid].k_end <= cutoff_id) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
+                while (run_idx < non_main_run_count &&
+                       non_main_run_data[run_idx].k_end <= cutoff_id) {
+                    ++run_idx;
                 }
-                run_idx = lo;
-                while (run_idx < run_count) {
-                    const CandidateRun& run = run_data[run_idx];
-                    size_t run_off = 0;
-                    if (cutoff_id >= run.k_start) {
-                        run_off = static_cast<size_t>(cutoff_id - run.k_start + 1);
-                        if (run_off >= run.len) {
-                            ++run_idx;
-                            continue;
-                        }
+                while (run_idx < non_main_run_count) {
+                    const CandidateRun& run = non_main_run_data[run_idx];
+                    const int k0 = std::max(run.k_start, cutoff_id + 1);
+                    if (k0 > run.k_end) {
+                        ++run_idx;
+                        continue;
                     }
-                    const int k0 = run.k_start + static_cast<int>(run_off);
-                    const size_t run_len = run.len - run_off;
+                    const size_t run_len = static_cast<size_t>(run.k_end - k0 + 1);
                     const SymDistScalar* main_ptr =
                         dist_data + main_base + static_cast<size_t>(k0 - main_id - 1);
                     const SymDistScalar* sec_ptr =
                         dist_data + sec_base + static_cast<size_t>(k0 - secondary_id - 1);
-                    SymDistScalar* out_ptr = out_col.data() + static_cast<size_t>(k0);
+                    SymDistScalar* dst_ptr =
+                        dist_data + main_base + static_cast<size_t>(k0 - main_id - 1);
 
 #if defined(RACPP_SIMD_DISSIM_TAIL_UPDATE) && RACPP_SIMD_DISSIM_TAIL_UPDATE && \
     defined(__AVX2__) && defined(__FMA__) && \
@@ -1010,21 +1001,21 @@ void update_cluster_dissimilarities(
                         const __m256 ds = _mm256_loadu_ps(sec_ptr + off);
                         const __m256 out =
                             _mm256_fmadd_ps(mw_vec, dm, _mm256_mul_ps(sw_vec, ds));
-                        _mm256_storeu_ps(out_ptr + off, out);
+                        _mm256_storeu_ps(dst_ptr + off, out);
                     }
                     for (; off < run_len; ++off) {
-                        out_ptr[off] = main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
+                        dst_ptr[off] = main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
                     }
                     for (size_t nn_off = 0; nn_off < run_len; ++nn_off) {
                         const int k = k0 + static_cast<int>(nn_off);
                         if (!is_nn_candidate_k(k)) continue;
-                        update_nn_best(out_ptr[nn_off], k, best_val, best_idx);
+                        update_nn_best(dst_ptr[nn_off], k, best_val, best_idx);
                     }
 #else
                     for (size_t off = 0; off < run_len; ++off) {
                         const SymDistScalar v =
                             main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
-                        out_ptr[off] = v;
+                        dst_ptr[off] = v;
                         const int k = k0 + static_cast<int>(off);
                         if (!is_nn_candidate_k(k)) continue;
                         update_nn_best(v, k, best_val, best_idx);
@@ -1142,10 +1133,12 @@ void update_cluster_dissimilarities(
             run_parallel_for(requested_threads, non_main_run_count, write_non_main_head_rows);
         }
 
-        // Contiguous region k>col_id: keep per-column writes (fast memcpy-like paths).
+        // Middle region (col_id < k <= cutoff): copy from merged_columns.
+        // Tail k>cutoff is already written directly into dist during compute.
         auto write_non_main_tail_range = [&](size_t start, size_t end) {
             for (size_t i = start; i < end; ++i) {
                 const int col_id = merge_main_ids[i];
+                const int cutoff_id = merge_cutoff_ids[i];
                 const size_t col_base = row_start[static_cast<size_t>(col_id)];
                 const SymDistScalar* col_ptr = merged_columns[i].data();
                 for (size_t r = 0; r < non_main_run_count; ++r) {
@@ -1154,10 +1147,11 @@ void update_cluster_dissimilarities(
                         continue;
                     }
                     const int k0 = std::max(run.k_start, col_id + 1);
-                    if (k0 > run.k_end) {
+                    const int k1 = std::min(run.k_end, cutoff_id);
+                    if (k0 > k1) {
                         continue;
                     }
-                    const size_t len = static_cast<size_t>(run.k_end - k0 + 1);
+                    const size_t len = static_cast<size_t>(k1 - k0 + 1);
                     SymDistScalar* dst =
                         dist_data + col_base + static_cast<size_t>(k0 - col_id - 1);
                     const SymDistScalar* src = col_ptr + static_cast<size_t>(k0);
