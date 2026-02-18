@@ -661,8 +661,14 @@ void update_cluster_dissimilarities(
     // Keep ids in ascending order so candidate iteration is contiguous/stable.
     std::vector<int> write_candidates;
     write_candidates.reserve(static_cast<size_t>(N));
+    std::vector<char> in_write_candidates(static_cast<size_t>(N), 0);
     std::vector<char> is_processed_secondary(static_cast<size_t>(N), 0);
     std::vector<char> is_batch_main(static_cast<size_t>(N), 0);
+    for (int k = 0; k < N; ++k) {
+        if (!is_alive_ws[k]) continue;
+        write_candidates.push_back(k);
+        in_write_candidates[static_cast<size_t>(k)] = 1;
+    }
     // Reuse per-batch metadata buffers across sub-batches.
     std::vector<int> merge_main_ids(max_batch);
     std::vector<int> merge_secondary_ids(max_batch);
@@ -735,13 +741,6 @@ void update_cluster_dissimilarities(
 
         const auto t_cand_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                           : std::chrono::high_resolution_clock::time_point{};
-        write_candidates.clear();
-        for (int k = 0; k < N; ++k) {
-            if (is_alive_ws[k] && !is_processed_secondary[static_cast<size_t>(k)]) {
-                write_candidates.push_back(k);
-            }
-        }
-
         const int* write_cand_data = write_candidates.data();
         const size_t write_cand_count = write_candidates.size();
         struct CandidateRun {
@@ -1163,10 +1162,25 @@ void update_cluster_dissimilarities(
         }
 
         // Mark processed secondaries so future sub-batches exclude them.
+        bool removed_any_from_candidates = false;
         for (size_t i = 0; i < batch_size; ++i) {
             const int sid = merge_secondary_ids[i];
             is_processed_secondary[static_cast<size_t>(sid)] = 1;
+            if (in_write_candidates[static_cast<size_t>(sid)]) {
+                in_write_candidates[static_cast<size_t>(sid)] = 0;
+                removed_any_from_candidates = true;
+            }
             is_batch_main[static_cast<size_t>(merge_main_ids[i])] = 0;
+        }
+        if (removed_any_from_candidates) {
+            size_t dst = 0;
+            const size_t cand_count = write_candidates.size();
+            for (size_t c = 0; c < cand_count; ++c) {
+                const int k = write_candidates[c];
+                if (!in_write_candidates[static_cast<size_t>(k)]) continue;
+                write_candidates[dst++] = k;
+            }
+            write_candidates.resize(dst);
         }
     }
 
