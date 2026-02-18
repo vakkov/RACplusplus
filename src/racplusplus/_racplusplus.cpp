@@ -872,7 +872,7 @@ void update_cluster_dissimilarities(
         auto compute_head_rows = [&](size_t start, size_t end) {
             const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
             const size_t* row_start = dist.row_start.data();
-            const SymDistScalar* dist_data = dist.data.data();
+            SymDistScalar* dist_data = dist.data.data();
             if (start >= end) {
                 return;
             }
@@ -937,7 +937,13 @@ void update_cluster_dissimilarities(
                                     static_cast<size_t>(k - secondary_id - 1)];
                     const SymDistScalar v = merge_main_weights[i] * d_main +
                                             merge_secondary_weights[i] * d_sec;
-                    out_col[k] = v;
+                    // Fuse head write-back for non-main rows where k < main_id.
+                    // For k >= main_id we still keep merged_columns for middle writes.
+                    if (!is_batch_main[static_cast<size_t>(k)] && k < main_id) {
+                        dist_data[row_k_base + static_cast<size_t>(main_id - k - 1)] = v;
+                    } else {
+                        out_col[k] = v;
+                    }
                     if (is_nn_candidate_k(k)) {
                         if (parallel_head) {
                             update_nn_best(v, k, local_best[i], local_best_idx[i]);
@@ -1082,56 +1088,13 @@ void update_cluster_dissimilarities(
         }
 
         // Write-back for merge mains:
-        // 1) row-major scattered head writes across columns (k < col_id)
-        // 2) parallel contiguous tail writes per merge main (k > col_id)
+        // 1) head writes (k < col_id) are fused into compute_head_rows
+        // 2) middle contiguous writes (col_id < k <= cutoff) from merged_columns
         // 3) deduplicated main-main writes once per pair
         // 4) serial DSU unions
         const auto t_write_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                            : std::chrono::high_resolution_clock::time_point{};
         SymDistScalar* dist_data = dist.data.data();
-
-        std::vector<size_t> main_id_order(batch_size);
-        std::iota(main_id_order.begin(), main_id_order.end(), static_cast<size_t>(0));
-        std::sort(main_id_order.begin(), main_id_order.end(),
-            [&merge_main_ids](size_t a, size_t b) {
-                return merge_main_ids[a] < merge_main_ids[b];
-            });
-        std::vector<int> sorted_main_ids(batch_size);
-        for (size_t p = 0; p < batch_size; ++p) {
-            sorted_main_ids[p] = merge_main_ids[main_id_order[p]];
-        }
-
-        // Scatter region k<col_id: process rows in order so writes for each row are contiguous.
-        auto write_non_main_head_rows = [&](size_t start, size_t end) {
-            for (size_t r = start; r < end; ++r) {
-                const CandidateRun& run = non_main_run_data[r];
-                size_t col_pos = 0;
-                while (col_pos < batch_size && sorted_main_ids[col_pos] <= run.k_start) {
-                    ++col_pos;
-                }
-                for (int k = run.k_start; k <= run.k_end; ++k) {
-                    while (col_pos < batch_size && sorted_main_ids[col_pos] <= k) {
-                        ++col_pos;
-                    }
-                    if (col_pos >= batch_size) {
-                        break;
-                    }
-                    SymDistScalar* row_ptr = dist_data + row_start[static_cast<size_t>(k)];
-                    for (size_t p = col_pos; p < batch_size; ++p) {
-                        const int col_id = sorted_main_ids[p];
-                        const size_t merge_idx = main_id_order[p];
-                        row_ptr[static_cast<size_t>(col_id - k - 1)] =
-                            merged_columns[merge_idx][k];
-                    }
-                }
-            }
-        };
-        const size_t head_write_threads = std::min(requested_threads, non_main_run_count);
-        if (head_write_threads <= 1 || non_main_run_count < 8) {
-            write_non_main_head_rows(0, non_main_run_count);
-        } else {
-            run_parallel_for(requested_threads, non_main_run_count, write_non_main_head_rows);
-        }
 
         // Middle region (col_id < k <= cutoff): copy from merged_columns.
         // Tail k>cutoff is already written directly into dist during compute.
