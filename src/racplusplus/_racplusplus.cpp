@@ -663,39 +663,6 @@ void update_cluster_dissimilarities(
     write_candidates.reserve(static_cast<size_t>(N));
     std::vector<char> is_processed_secondary(static_cast<size_t>(N), 0);
     std::vector<char> is_batch_main(static_cast<size_t>(N), 0);
-    // NN refresh candidates (exclude iteration secondaries).
-    std::vector<int> nn_candidates;
-    nn_candidates.reserve(static_cast<size_t>(N));
-    for (int k = 0; k < N; ++k) {
-        if (!is_alive_ws[k]) continue;
-        if (!is_iter_secondary[k]) {
-            nn_candidates.push_back(k);
-        }
-    }
-    struct IdRun {
-        int k_start;
-        size_t len;
-    };
-    std::vector<IdRun> nn_candidate_runs;
-    nn_candidate_runs.reserve(nn_candidates.size() > 0 ? nn_candidates.size() / 4 : 0);
-    if (!nn_candidates.empty()) {
-        size_t run_start = 0;
-        const size_t nn_count = nn_candidates.size();
-        for (size_t c = 1; c <= nn_count; ++c) {
-            const bool is_break =
-                (c == nn_count) ||
-                (nn_candidates[c] != nn_candidates[c - 1] + 1);
-            if (!is_break) continue;
-            nn_candidate_runs.push_back(IdRun{
-                nn_candidates[run_start],
-                c - run_start
-            });
-            run_start = c;
-        }
-    }
-    const IdRun* nn_run_data = nn_candidate_runs.data();
-    const size_t nn_run_count = nn_candidate_runs.size();
-
     // Reuse per-batch metadata buffers across sub-batches.
     std::vector<int> merge_main_ids(max_batch);
     std::vector<int> merge_secondary_ids(max_batch);
@@ -875,6 +842,30 @@ void update_cluster_dissimilarities(
                     write_cand_data, write_cand_data + write_cand_count, max_cutoff) -
                 write_cand_data)
             : 0;
+        const size_t head_threads = std::min(requested_threads, head_cand_count);
+        const bool parallel_head = (head_threads > 1 && head_cand_count >= 256);
+
+        std::vector<SymDistScalar> nn_best(batch_size, std::numeric_limits<SymDistScalar>::infinity());
+        std::vector<int> nn_best_idx(batch_size, -1);
+        std::vector<std::vector<SymDistScalar>> nn_head_best_locals;
+        std::vector<std::vector<int>> nn_head_idx_locals;
+        std::atomic<size_t> nn_head_slot_counter{0};
+        if (parallel_head) {
+            nn_head_best_locals.assign(
+                head_threads,
+                std::vector<SymDistScalar>(batch_size, std::numeric_limits<SymDistScalar>::infinity()));
+            nn_head_idx_locals.assign(head_threads, std::vector<int>(batch_size, -1));
+        }
+        auto update_nn_best = [&](SymDistScalar v, int k, SymDistScalar& best, int& idx) {
+            if (v < best || (v == best && (idx == -1 || k < idx))) {
+                best = v;
+                idx = k;
+            }
+        };
+        auto is_nn_candidate_k = [&](int k) -> bool {
+            return !is_iter_secondary[static_cast<size_t>(k)] &&
+                   !is_batch_main[static_cast<size_t>(k)];
+        };
 
         // Head compute: traverse candidate rows and update all merges with k<cutoff.
         // This improves row-cache reuse compared to scanning head per merge column.
@@ -884,6 +875,14 @@ void update_cluster_dissimilarities(
             const SymDistScalar* dist_data = dist.data.data();
             if (start >= end) {
                 return;
+            }
+            SymDistScalar* local_best = nullptr;
+            int* local_best_idx = nullptr;
+            if (parallel_head) {
+                const size_t slot =
+                    nn_head_slot_counter.fetch_add(1, std::memory_order_relaxed);
+                local_best = nn_head_best_locals[slot].data();
+                local_best_idx = nn_head_idx_locals[slot].data();
             }
 
             size_t order_pos = static_cast<size_t>(
@@ -936,8 +935,16 @@ void update_cluster_dissimilarities(
                         ? dist_data[row_k_base + static_cast<size_t>(secondary_id - k - 1)]
                         : dist_data[merge_secondary_bases[i] +
                                     static_cast<size_t>(k - secondary_id - 1)];
-                    out_col[k] = merge_main_weights[i] * d_main +
-                                 merge_secondary_weights[i] * d_sec;
+                    const SymDistScalar v = merge_main_weights[i] * d_main +
+                                            merge_secondary_weights[i] * d_sec;
+                    out_col[k] = v;
+                    if (is_nn_candidate_k(k)) {
+                        if (parallel_head) {
+                            update_nn_best(v, k, local_best[i], local_best_idx[i]);
+                        } else {
+                            update_nn_best(v, k, nn_best[i], nn_best_idx[i]);
+                        }
+                    }
                 }
             }
         };
@@ -953,6 +960,8 @@ void update_cluster_dissimilarities(
                 const SymDistScalar main_weight = merge_main_weights[i];
                 const SymDistScalar secondary_weight = merge_secondary_weights[i];
                 SymDistVector& out_col = merged_columns[i];
+                SymDistScalar best_val = nn_best[i];
+                int best_idx = nn_best_idx[i];
 
                 const size_t main_base = merge_main_bases[i];
                 const size_t sec_base = merge_secondary_bases[i];
@@ -1006,39 +1015,69 @@ void update_cluster_dissimilarities(
                     for (; off < run_len; ++off) {
                         out_ptr[off] = main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
                     }
+                    for (size_t nn_off = 0; nn_off < run_len; ++nn_off) {
+                        const int k = k0 + static_cast<int>(nn_off);
+                        if (!is_nn_candidate_k(k)) continue;
+                        update_nn_best(out_ptr[nn_off], k, best_val, best_idx);
+                    }
 #else
                     for (size_t off = 0; off < run_len; ++off) {
-                        out_ptr[off] = main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
+                        const SymDistScalar v =
+                            main_weight * main_ptr[off] + secondary_weight * sec_ptr[off];
+                        out_ptr[off] = v;
+                        const int k = k0 + static_cast<int>(off);
+                        if (!is_nn_candidate_k(k)) continue;
+                        update_nn_best(v, k, best_val, best_idx);
                     }
 #endif
                     ++run_idx;
                 }
 
                 for (size_t j = 0; j < i; ++j) {
+                    const int k = merge_main_ids[j];
                     const SymDistScalar patched =
                         cross_dist[cross_row_start[j] + (i - j - 1)];
-                    out_col[merge_main_ids[j]] = patched;
+                    out_col[k] = patched;
+                    if (!is_iter_secondary[static_cast<size_t>(k)]) {
+                        update_nn_best(patched, k, best_val, best_idx);
+                    }
                 }
                 for (size_t j = i + 1; j < batch_size; ++j) {
+                    const int k = merge_main_ids[j];
                     const SymDistScalar patched =
                         cross_dist[cross_row_start[i] + (j - i - 1)];
-                    out_col[merge_main_ids[j]] = patched;
+                    out_col[k] = patched;
+                    if (!is_iter_secondary[static_cast<size_t>(k)]) {
+                        update_nn_best(patched, k, best_val, best_idx);
+                    }
                 }
 
                 out_col[main_id] = inf;
                 out_col[secondary_id] = inf;
+
+                const double best_val_d = static_cast<double>(best_val);
+                clusters[main_id].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
+                clusters[main_id].nn_distance = best_val_d;
             }
         };
 
         size_t no_threads = std::min(requested_threads, batch_size);
         const auto t_compute_0 = profile_ops ? std::chrono::high_resolution_clock::now()
                                              : std::chrono::high_resolution_clock::time_point{};
-        const size_t head_threads = std::min(requested_threads, head_cand_count);
         if (head_cand_count > 0) {
-            if (head_threads <= 1 || head_cand_count < 256) {
+            if (!parallel_head) {
                 compute_head_rows(0, head_cand_count);
             } else {
                 run_parallel_for(requested_threads, head_cand_count, compute_head_rows);
+                for (size_t s = 0; s < head_threads; ++s) {
+                    const SymDistScalar* local_best = nn_head_best_locals[s].data();
+                    const int* local_idx = nn_head_idx_locals[s].data();
+                    for (size_t i = 0; i < batch_size; ++i) {
+                        const int idx = local_idx[i];
+                        if (idx < 0) continue;
+                        update_nn_best(local_best[i], idx, nn_best[i], nn_best_idx[i]);
+                    }
+                }
             }
         }
         if (no_threads <= 1) {
@@ -1171,82 +1210,6 @@ void update_cluster_dissimilarities(
             const int sid = merge_secondary_ids[i];
             is_processed_secondary[static_cast<size_t>(sid)] = 1;
             is_batch_main[static_cast<size_t>(merge_main_ids[i])] = 0;
-        }
-        // Compute tentative NN for merge mains from contiguous merged_columns
-        // for every batch. update_cluster_nn_dist validates changed=1 mains
-        // against later-batch mains and falls back to full scan when needed.
-        const auto t_batch_nn_0 = profile_ops ? std::chrono::high_resolution_clock::now()
-                                              : std::chrono::high_resolution_clock::time_point{};
-        auto batch_nn_range = [&](size_t start, size_t end) {
-            const SymDistScalar inf = std::numeric_limits<SymDistScalar>::infinity();
-            for (size_t i = start; i < end; i++) {
-                const int main_id = merge_main_ids[i];
-                const SymDistScalar* col_data = merged_columns[i].data();
-                SymDistScalar best_val = inf;
-                int best_idx = -1;
-
-                for (size_t r = 0; r < nn_run_count; ++r) {
-                    const int k0 = nn_run_data[r].k_start;
-                    const size_t len = nn_run_data[r].len;
-                    const SymDistScalar* seg = col_data + static_cast<size_t>(k0);
-#if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
-    defined(__AVX2__) && defined(__FMA__) && \
-    defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
-                    SymDistScalar seg_best = inf;
-                    int seg_best_off = -1;
-                    size_t off = 0;
-                    for (; off + 7 < len; off += 8) {
-                        const __m256 v = _mm256_loadu_ps(seg + off);
-                        const float block_best = hmin_ps256(v);
-                        if (block_best < seg_best) {
-                            seg_best = block_best;
-                            alignas(32) float lanes[8];
-                            _mm256_store_ps(lanes, v);
-                            for (int lane = 0; lane < 8; ++lane) {
-                                if (lanes[lane] == block_best) {
-                                    seg_best_off = static_cast<int>(off) + lane;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    for (; off < len; ++off) {
-                        const SymDistScalar v = seg[off];
-                        if (v < seg_best) {
-                            seg_best = v;
-                            seg_best_off = static_cast<int>(off);
-                        }
-                    }
-                    if (seg_best_off >= 0 && seg_best < best_val) {
-                        best_val = seg_best;
-                        best_idx = k0 + seg_best_off;
-                    }
-#else
-                    for (size_t off = 0; off < len; ++off) {
-                        const SymDistScalar v = seg[off];
-                        if (v < best_val) {
-                            best_val = v;
-                            best_idx = k0 + static_cast<int>(off);
-                        }
-                    }
-#endif
-                }
-
-                const double best_val_d = static_cast<double>(best_val);
-                clusters[main_id].nn = (best_val_d < max_merge_distance) ? best_idx : -1;
-                clusters[main_id].nn_distance = best_val_d;
-            }
-        };
-        const size_t batch_nn_threads = std::min(requested_threads, batch_size);
-        if (batch_nn_threads <= 1 || batch_size < 64) {
-            batch_nn_range(0, batch_size);
-        } else {
-            run_parallel_for(requested_threads, batch_size, batch_nn_range);
-        }
-        if (profile_ops) {
-            const auto t_batch_nn_1 = std::chrono::high_resolution_clock::now();
-            g_dense_ops_profile.dissim_batch_nn_ns +=
-                ns_between(t_batch_nn_0, t_batch_nn_1);
         }
     }
 
