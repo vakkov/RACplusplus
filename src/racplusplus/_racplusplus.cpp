@@ -900,6 +900,26 @@ void update_cluster_dissimilarities(
                 }
                 const size_t row_k_base = row_start[static_cast<size_t>(k)];
                 for (size_t p = order_pos; p < batch_size; ++p) {
+#if defined(__GNUC__) || defined(__clang__)
+                    constexpr size_t PREFETCH_AHEAD = 6;
+                    if (p + PREFETCH_AHEAD < batch_size) {
+                        const size_t i_pf = cutoff_order[p + PREFETCH_AHEAD];
+                        const int main_pf = merge_main_ids[i_pf];
+                        const int sec_pf = merge_secondary_ids[i_pf];
+                        const SymDistScalar* main_addr_pf = (k < main_pf)
+                            ? (dist_data + row_k_base +
+                               static_cast<size_t>(main_pf - k - 1))
+                            : (dist_data + merge_main_bases[i_pf] +
+                               static_cast<size_t>(k - main_pf - 1));
+                        const SymDistScalar* sec_addr_pf = (k < sec_pf)
+                            ? (dist_data + row_k_base +
+                               static_cast<size_t>(sec_pf - k - 1))
+                            : (dist_data + merge_secondary_bases[i_pf] +
+                               static_cast<size_t>(k - sec_pf - 1));
+                        __builtin_prefetch(main_addr_pf, 0, 0);
+                        __builtin_prefetch(sec_addr_pf, 0, 0);
+                    }
+#endif
                     const size_t i = cutoff_order[p];
                     const int main_id = merge_main_ids[i];
                     const int secondary_id = merge_secondary_ids[i];
@@ -2268,7 +2288,9 @@ void update_cluster_nn_dist(
                     best_idx = tentative_nn;
                     const size_t cid_base = row_start[static_cast<size_t>(cid)];
 
-                    for (int k : changed_main_ids) {
+                    const size_t changed_main_count = changed_main_ids.size();
+                    for (size_t ck = 0; ck < changed_main_count; ++ck) {
+                        const int k = changed_main_ids[ck];
                         if (k == cid || !alive[k] || dead[k]) continue;
                         const int k_batch = main_to_batch[static_cast<size_t>(k)];
                         if (k_batch <= my_batch) continue;  // only later-batch mains
@@ -2345,6 +2367,14 @@ void update_cluster_nn_dist(
                     if (run.k_start >= min_cid) break;
                     const int k1 = std::min(run.k_end, min_cid - 1);
                     for (int k = run.k_start; k <= k1; ++k) {
+#if defined(__GNUC__) || defined(__clang__)
+                        constexpr int PREFETCH_AHEAD = 2;
+                        if (k + PREFETCH_AHEAD <= k1) {
+                            const SymDistScalar* row_pf =
+                                dist_data + row_start[static_cast<size_t>(k + PREFETCH_AHEAD)];
+                            __builtin_prefetch(row_pf, 0, 1);
+                        }
+#endif
                         const SymDistScalar* row_k =
                             dist_data + row_start[static_cast<size_t>(k)];
                         for (size_t b = 0; b < B; ++b) {
@@ -2367,6 +2397,14 @@ void update_cluster_nn_dist(
                     const int k0 = std::max(run.k_start, min_cid);
                     const int k1 = std::min(run.k_end, max_cid);
                     for (int k = k0; k <= k1; ++k) {
+#if defined(__GNUC__) || defined(__clang__)
+                        constexpr int PREFETCH_AHEAD = 2;
+                        if (k + PREFETCH_AHEAD <= k1) {
+                            const SymDistScalar* row_pf =
+                                dist_data + row_start[static_cast<size_t>(k + PREFETCH_AHEAD)];
+                            __builtin_prefetch(row_pf, 0, 1);
+                        }
+#endif
                         const SymDistScalar* row_k =
                             dist_data + row_start[static_cast<size_t>(k)];
                         for (size_t b = 0; b < B; ++b) {
