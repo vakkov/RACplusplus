@@ -360,31 +360,58 @@ void Cluster::update_nn(double max_merge_distance) {
         return;
     }
 
-    double min = std::numeric_limits<double>::infinity();
-    int nn = -1;
+    double best = std::numeric_limits<double>::infinity();
+    int best_idx = -1;
 
     for (auto& neighbor : this->neighbor_distances) {
-        double dissimilarity = neighbor.second;
-        if (dissimilarity < min) {
-            min = dissimilarity;
-            nn = neighbor.first;
+        const double v = neighbor.second;
+        const int idx = neighbor.first;
+        if (v < best || (v == best && (best_idx == -1 || idx < best_idx))) {
+            best = v;
+            best_idx = idx;
         }
     }
 
-    nn_distance = min;
-    if (min < max_merge_distance) {
-        this->nn = nn;
+    nn_distance = best;
+    if (best < max_merge_distance) {
+        this->nn = best_idx;
     } else {
         this->nn = -1;
     }
 }
 
 void Cluster::update_nn(const SymDistMatrix& dist, double max_merge_distance) {
-    auto [min_val, min_idx] = dist.min_in_col(this->id);
-    nn_distance = min_val;
+    const int cid = this->id;
+    const double inf = std::numeric_limits<double>::infinity();
+    double best = inf;
+    int best_idx = -1;
 
-    if (min_val < max_merge_distance) {
-        this->nn = min_idx;
+    const size_t* row_start = dist.row_start.data();
+    const SymDistScalar* data = dist.data.data();
+    for (int k = 0; k < cid; ++k) {
+        const size_t idx =
+            row_start[static_cast<size_t>(k)] +
+            static_cast<size_t>(cid - k - 1);
+        const double v = static_cast<double>(data[idx]);
+        if (v < best || (v == best && (best_idx == -1 || k < best_idx))) {
+            best = v;
+            best_idx = k;
+        }
+    }
+    if (cid + 1 < dist.N) {
+        const size_t base = row_start[static_cast<size_t>(cid)];
+        for (int k = cid + 1; k < dist.N; ++k) {
+            const double v = static_cast<double>(data[base + static_cast<size_t>(k - cid - 1)]);
+            if (v < best || (v == best && (best_idx == -1 || k < best_idx))) {
+                best = v;
+                best_idx = k;
+            }
+        }
+    }
+
+    nn_distance = best;
+    if (best < max_merge_distance) {
+        this->nn = best_idx;
     } else {
         this->nn = -1;
     }
@@ -827,8 +854,10 @@ void update_cluster_dissimilarities(
         std::vector<size_t> cutoff_order(batch_size);
         std::iota(cutoff_order.begin(), cutoff_order.end(), static_cast<size_t>(0));
         std::sort(cutoff_order.begin(), cutoff_order.end(),
-            [&merge_cutoff_ids](size_t a, size_t b) {
-                return merge_cutoff_ids[a] < merge_cutoff_ids[b];
+            [&merge_cutoff_ids, &merge_main_ids](size_t a, size_t b) {
+                const int ca = merge_cutoff_ids[a], cb = merge_cutoff_ids[b];
+                if (ca != cb) return ca < cb;
+                return merge_main_ids[a] < merge_main_ids[b];
             });
         std::vector<int> ordered_cutoffs(batch_size);
         for (size_t p = 0; p < batch_size; ++p) {
@@ -1240,7 +1269,6 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
         const size_t slot = slot_counter.fetch_add(1, std::memory_order_relaxed);
         std::vector<double>& nn_best_local = nn_best_locals[slot];
         std::vector<int>& nn_idx_local = nn_idx_locals[slot];
-
         auto update_local_nn = [&](int src, int dst, double val) {
             double& best = nn_best_local[src];
             int& idx = nn_idx_local[src];
@@ -1380,12 +1408,14 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
         const std::vector<double>& local_best = nn_best_locals[s];
         const std::vector<int>& local_idx = nn_idx_locals[s];
         for (int k = 0; k < N; k++) {
-            const int idx = local_idx[k];
-            if (idx < 0) continue;
+            const int dst = local_idx[k];
+            if (dst < 0) continue;
             const double val = local_best[k];
-            if (val < nn_best[k] || (val == nn_best[k] && (nn_idx[k] == -1 || idx < nn_idx[k]))) {
-                nn_best[k] = val;
-                nn_idx[k] = idx;
+            double& best = nn_best[k];
+            int& idx = nn_idx[k];
+            if (val < best || (val == best && (idx == -1 || dst < idx))) {
+                best = val;
+                idx = dst;
             }
         }
     }
@@ -1434,6 +1464,13 @@ void calculate_initial_dissimilarities(
         int nearest_neighbor = -1;
         double min = std::numeric_limits<double>::infinity();
 
+        auto update_nn = [&](double distance, int j) {
+            if (distance < min || (distance == min && (nearest_neighbor == -1 || j < nearest_neighbor))) {
+                min = distance;
+                nearest_neighbor = j;
+            }
+        };
+
         for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
             int j = it.index();
             bool value = it.value();
@@ -1452,16 +1489,12 @@ void calculate_initial_dissimilarities(
                 }
 
                 neighbors.push_back(std::make_pair(j, distance));
-
-                if (distance < min && distance < max_merge_distance) {
-                    min = distance;
-                    nearest_neighbor = j;
-                }
+                update_nn(distance, j);
             }
         }
 
         cluster.neighbor_distances = std::move(neighbors);
-        cluster.nn = nearest_neighbor;
+        cluster.nn = (min < max_merge_distance) ? nearest_neighbor : -1;
         cluster.nn_distance = min;
     };
 
@@ -2657,8 +2690,8 @@ void RAC_i(
         const size_t curr_n = static_cast<size_t>(dist.N);
         constexpr size_t MIN_COMPACT_ACTIVE = 64;
         constexpr size_t MIN_COMPACT_N = 8192;
-        constexpr size_t MIN_COMPACT_DROP = 4096;
-        constexpr int MAX_COMPACTIONS = 2;
+        constexpr size_t MIN_COMPACT_DROP = 2048;
+        constexpr int MAX_COMPACTIONS = 4;
         const bool should_compact =
             active_count > MIN_COMPACT_ACTIVE &&
             curr_n >= MIN_COMPACT_N &&
