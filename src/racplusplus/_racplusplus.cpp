@@ -89,6 +89,25 @@ static inline double ns_to_ms(long long ns) {
     return static_cast<double>(ns) / 1e6;
 }
 
+static inline int racpp_dense_init_tile_size() {
+    // Cached once per process; allows quick tuning without code changes.
+    static int cached_tile = 0;
+    if (cached_tile != 0) {
+        return cached_tile;
+    }
+
+    int tile = 768;
+    if (const char* env = std::getenv("RACPP_DENSE_INIT_TILE")) {
+        char* end_ptr = nullptr;
+        const long parsed = std::strtol(env, &end_ptr, 10);
+        if (end_ptr != env && parsed >= 64 && parsed <= 4096) {
+            tile = static_cast<int>(parsed);
+        }
+    }
+    cached_tile = tile;
+    return cached_tile;
+}
+
 #if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
     defined(__AVX2__) && defined(__FMA__) && \
     defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
@@ -1227,7 +1246,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
 
     const int N = static_cast<int>(clusters.size());
     const int D = static_cast<int>(base_arr.rows());
-    const int TILE = 1024;
+    const int TILE = racpp_dense_init_tile_size();
     const bool is_cosine = (distance_metric == "cosine");
     const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(Eigen::nbThreads()));
 
@@ -1238,161 +1257,194 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
         sq_norms = base_arr.colwise().squaredNorm();
     }
 
-    // Build tile pair worklist for parallel dispatch.
-    struct TilePair { int i_start, i_end, j_start, j_end; };
-    std::vector<TilePair> tile_pairs;
-    tile_pairs.reserve(
-        ((N + TILE - 1) / TILE) * ((N + TILE - 1) / TILE + 1) / 2);
-    for (int i_start = 0; i_start < N; i_start += TILE) {
-        const int i_end = std::min(i_start + TILE, N);
-        for (int j_start = i_start; j_start < N; j_start += TILE) {
-            const int j_end = std::min(j_start + TILE, N);
-            tile_pairs.push_back({i_start, i_end, j_start, j_end});
-        }
-    }
-
     // Phase 1: Parallel tile GEMM + storage + thread-local NN tracking.
-    // Each tile pair writes to a disjoint region of dist.data, so no races.
-    // Single-threaded GEMM per tile avoids Eigen thread sync overhead.
-    const size_t local_slots = std::min(n_threads, tile_pairs.size());
+    // Each i-tile owns disjoint output rows in triangular storage (no races).
+    // Dynamic i-tile stealing keeps load balanced.
+    const int i_tile_count = (N + TILE - 1) / TILE;
+    const size_t local_slots = std::min(n_threads, static_cast<size_t>(i_tile_count));
     const double inf = std::numeric_limits<double>::infinity();
     std::vector<std::vector<double>> nn_best_locals(
         local_slots, std::vector<double>(N, inf));
     std::vector<std::vector<int>> nn_idx_locals(
         local_slots, std::vector<int>(N, -1));
     std::atomic<size_t> slot_counter{0};
+    std::atomic<int> next_i_tile{0};
 
     const int saved_threads = Eigen::nbThreads();
     Eigen::setNbThreads(1);
 
-    run_parallel_for(n_threads, tile_pairs.size(), [&](size_t start, size_t end) {
-        const size_t slot = slot_counter.fetch_add(1, std::memory_order_relaxed);
-        std::vector<double>& nn_best_local = nn_best_locals[slot];
-        std::vector<int>& nn_idx_local = nn_idx_locals[slot];
-        auto update_local_nn = [&](int src, int dst, double val) {
-            double& best = nn_best_local[src];
-            int& idx = nn_idx_local[src];
-            if (val < best || (val == best && (idx == -1 || dst < idx))) {
-                best = val;
-                idx = dst;
-            }
-        };
-
-        using TileMatrix =
-            Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        TileMatrix tile;
-
-        for (size_t t = start; t < end; t++) {
-            const auto& tp = tile_pairs[t];
-            const int tile_i = tp.i_end - tp.i_start;
-            const int tile_j = tp.j_end - tp.j_start;
-
-            auto Bi = base_arr.block(0, tp.i_start, D, tile_i);
-            auto Bj = base_arr.block(0, tp.j_start, D, tile_j);
-
-            tile.noalias() = Bi.transpose() * Bj;
-
-            if (!is_cosine) {
-                tile *= Scalar(-2);
-                for (int r = 0; r < tile_i; r++)
-                    tile.row(r).array() += sq_norms[tp.i_start + r];
-                for (int c = 0; c < tile_j; c++)
-                    tile.col(c).array() += sq_norms[tp.j_start + c];
-                tile = tile.array().max(Scalar(0)).sqrt().matrix();
-            }
-
-            // Store to triangular matrix — branchless, no NN tracking.
-            if (tp.i_start == tp.j_start) {
-                // Diagonal tile: upper triangle only.
-                for (int r = 0; r < tile_i; r++) {
-                    const int i_global = tp.i_start + r;
-                    const int c_start = r + 1;
-                    if (c_start >= tile_j) continue;
-                    const size_t base_idx =
-                        dist.row_start[static_cast<size_t>(i_global)];
-                    if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
-                        for (int c = c_start; c < tile_j; c++) {
-                            const Scalar v =
-                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
-                            dist.data[base_idx + (c - c_start)] = v;
-                            const int j_global = tp.j_start + c;
-                            const double val = static_cast<double>(v);
-                            update_local_nn(i_global, j_global, val);
-                            update_local_nn(j_global, i_global, val);
-                        }
-                    } else {
-                        for (int c = c_start; c < tile_j; c++) {
-                            const Scalar v =
-                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
-                            dist.data[base_idx + (c - c_start)] =
-                                static_cast<SymDistScalar>(v);
-                            const int j_global = tp.j_start + c;
-                            const double val = static_cast<double>(v);
-                            update_local_nn(i_global, j_global, val);
-                            update_local_nn(j_global, i_global, val);
-                        }
-                    }
+    run_parallel_for(n_threads, local_slots, [&](size_t start, size_t end) {
+        for (size_t worker = start; worker < end; ++worker) {
+            (void)worker;
+            const size_t slot = slot_counter.fetch_add(1, std::memory_order_relaxed);
+            std::vector<double>& nn_best_local = nn_best_locals[slot];
+            std::vector<int>& nn_idx_local = nn_idx_locals[slot];
+            auto update_local_nn = [&](int src, int dst, double val) {
+                double& best = nn_best_local[src];
+                int& idx = nn_idx_local[src];
+                if (val < best || (val == best && (idx == -1 || dst < idx))) {
+                    best = val;
+                    idx = dst;
                 }
-            } else {
-                // Off-diagonal tile: all (i,j) satisfy i < j.
-                // Writes are contiguous per row in triangular storage.
-                for (int r = 0; r < tile_i; r++) {
-                    const int i_global = tp.i_start + r;
-                    const size_t base_idx =
-                        dist.row_start[static_cast<size_t>(i_global)] +
-                        static_cast<size_t>(tp.j_start - i_global - 1);
-                    if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
-#if defined(RACPP_SPLIT_STORE_NN) && RACPP_SPLIT_STORE_NN
-                        for (int c = 0; c < tile_j; c++) {
-                            const Scalar v =
-                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
-                            dist.data[base_idx + c] = v;
+            };
+
+            using TileMatrix =
+                Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+            TileMatrix tile;
+            std::vector<double> tile_row_best(static_cast<size_t>(TILE), inf);
+            std::vector<int> tile_row_idx(static_cast<size_t>(TILE), -1);
+            std::vector<double> tile_col_best(static_cast<size_t>(TILE), inf);
+            std::vector<int> tile_col_idx(static_cast<size_t>(TILE), -1);
+
+            while (true) {
+                const int i_tile = next_i_tile.fetch_add(1, std::memory_order_relaxed);
+                if (i_tile >= i_tile_count) {
+                    break;
+                }
+                const int i_start = i_tile * TILE;
+                const int i_end = std::min(i_start + TILE, N);
+                const int tile_i = i_end - i_start;
+                auto Bi = base_arr.block(0, i_start, D, tile_i);
+
+                for (int j_start = i_start; j_start < N; j_start += TILE) {
+                    const int j_end = std::min(j_start + TILE, N);
+                    const int tile_j = j_end - j_start;
+                    auto Bj = base_arr.block(0, j_start, D, tile_j);
+
+                    tile.noalias() = Bi.transpose() * Bj;
+
+                    if (!is_cosine) {
+                        tile *= Scalar(-2);
+                        for (int r = 0; r < tile_i; r++)
+                            tile.row(r).array() += sq_norms[i_start + r];
+                        for (int c = 0; c < tile_j; c++)
+                            tile.col(c).array() += sq_norms[j_start + c];
+                        tile = tile.array().max(Scalar(0)).sqrt().matrix();
+                    }
+
+                    if (i_start == j_start) {
+                        // Diagonal tile: upper triangle only.
+                        std::fill_n(tile_row_best.data(), static_cast<size_t>(tile_i), inf);
+                        std::fill_n(tile_row_idx.data(), static_cast<size_t>(tile_i), -1);
+                        for (int r = 0; r < tile_i; r++) {
+                            const int i_global = i_start + r;
+                            const int c_start = r + 1;
+                            if (c_start >= tile_j) continue;
+                            const size_t base_idx =
+                                dist.row_start[static_cast<size_t>(i_global)];
+                            if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
+                                for (int c = c_start; c < tile_j; c++) {
+                                    const Scalar v =
+                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    dist.data[base_idx + (c - c_start)] = v;
+                                    const int j_global = j_start + c;
+                                    const double val = static_cast<double>(v);
+                                    double& best_i = tile_row_best[static_cast<size_t>(r)];
+                                    int& idx_i = tile_row_idx[static_cast<size_t>(r)];
+                                    if (val < best_i || (val == best_i && (idx_i == -1 || j_global < idx_i))) {
+                                        best_i = val;
+                                        idx_i = j_global;
+                                    }
+                                    double& best_j = tile_row_best[static_cast<size_t>(c)];
+                                    int& idx_j = tile_row_idx[static_cast<size_t>(c)];
+                                    if (val < best_j || (val == best_j && (idx_j == -1 || i_global < idx_j))) {
+                                        best_j = val;
+                                        idx_j = i_global;
+                                    }
+                                }
+                            } else {
+                                for (int c = c_start; c < tile_j; c++) {
+                                    const Scalar v =
+                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    dist.data[base_idx + (c - c_start)] =
+                                        static_cast<SymDistScalar>(v);
+                                    const int j_global = j_start + c;
+                                    const double val = static_cast<double>(v);
+                                    double& best_i = tile_row_best[static_cast<size_t>(r)];
+                                    int& idx_i = tile_row_idx[static_cast<size_t>(r)];
+                                    if (val < best_i || (val == best_i && (idx_i == -1 || j_global < idx_i))) {
+                                        best_i = val;
+                                        idx_i = j_global;
+                                    }
+                                    double& best_j = tile_row_best[static_cast<size_t>(c)];
+                                    int& idx_j = tile_row_idx[static_cast<size_t>(c)];
+                                    if (val < best_j || (val == best_j && (idx_j == -1 || i_global < idx_j))) {
+                                        best_j = val;
+                                        idx_j = i_global;
+                                    }
+                                }
+                            }
                         }
-                        const SymDistScalar* written = dist.data.data() + base_idx;
-                        for (int c = 0; c < tile_j; c++) {
-                            const int j_global = tp.j_start + c;
-                            const double val = static_cast<double>(written[c]);
-                            update_local_nn(i_global, j_global, val);
-                            update_local_nn(j_global, i_global, val);
+                        for (int local = 0; local < tile_i; ++local) {
+                            const int dst = tile_row_idx[static_cast<size_t>(local)];
+                            if (dst < 0) continue;
+                            update_local_nn(i_start + local, dst, tile_row_best[static_cast<size_t>(local)]);
                         }
-#else
-                        for (int c = 0; c < tile_j; c++) {
-                            const Scalar v =
-                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
-                            dist.data[base_idx + c] = v;
-                            const int j_global = tp.j_start + c;
-                            const double val = static_cast<double>(v);
-                            update_local_nn(i_global, j_global, val);
-                            update_local_nn(j_global, i_global, val);
-                        }
-#endif
                     } else {
-#if defined(RACPP_SPLIT_STORE_NN) && RACPP_SPLIT_STORE_NN
-                        for (int c = 0; c < tile_j; c++) {
-                            const Scalar v =
-                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
-                            dist.data[base_idx + c] =
-                                static_cast<SymDistScalar>(v);
+                        // Off-diagonal tile: all (i,j) satisfy i < j.
+                        // Writes are contiguous per row in triangular storage.
+                        std::fill_n(tile_row_best.data(), static_cast<size_t>(tile_i), inf);
+                        std::fill_n(tile_row_idx.data(), static_cast<size_t>(tile_i), -1);
+                        std::fill_n(tile_col_best.data(), static_cast<size_t>(tile_j), inf);
+                        std::fill_n(tile_col_idx.data(), static_cast<size_t>(tile_j), -1);
+                        for (int r = 0; r < tile_i; r++) {
+                            const int i_global = i_start + r;
+                            const size_t base_idx =
+                                dist.row_start[static_cast<size_t>(i_global)] +
+                                static_cast<size_t>(j_start - i_global - 1);
+                            if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
+                                for (int c = 0; c < tile_j; c++) {
+                                    const Scalar v =
+                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    dist.data[base_idx + c] = v;
+                                    const int j_global = j_start + c;
+                                    const double val = static_cast<double>(v);
+                                    double& best_i = tile_row_best[static_cast<size_t>(r)];
+                                    int& idx_i = tile_row_idx[static_cast<size_t>(r)];
+                                    if (val < best_i || (val == best_i && (idx_i == -1 || j_global < idx_i))) {
+                                        best_i = val;
+                                        idx_i = j_global;
+                                    }
+                                    double& best_j = tile_col_best[static_cast<size_t>(c)];
+                                    int& idx_j = tile_col_idx[static_cast<size_t>(c)];
+                                    if (val < best_j || (val == best_j && (idx_j == -1 || i_global < idx_j))) {
+                                        best_j = val;
+                                        idx_j = i_global;
+                                    }
+                                }
+                            } else {
+                                for (int c = 0; c < tile_j; c++) {
+                                    const Scalar v =
+                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    dist.data[base_idx + c] =
+                                        static_cast<SymDistScalar>(v);
+                                    const int j_global = j_start + c;
+                                    const double val = static_cast<double>(v);
+                                    double& best_i = tile_row_best[static_cast<size_t>(r)];
+                                    int& idx_i = tile_row_idx[static_cast<size_t>(r)];
+                                    if (val < best_i || (val == best_i && (idx_i == -1 || j_global < idx_i))) {
+                                        best_i = val;
+                                        idx_i = j_global;
+                                    }
+                                    double& best_j = tile_col_best[static_cast<size_t>(c)];
+                                    int& idx_j = tile_col_idx[static_cast<size_t>(c)];
+                                    if (val < best_j || (val == best_j && (idx_j == -1 || i_global < idx_j))) {
+                                        best_j = val;
+                                        idx_j = i_global;
+                                    }
+                                }
+                            }
                         }
-                        const SymDistScalar* written = dist.data.data() + base_idx;
-                        for (int c = 0; c < tile_j; c++) {
-                            const int j_global = tp.j_start + c;
-                            const double val = static_cast<double>(written[c]);
-                            update_local_nn(i_global, j_global, val);
-                            update_local_nn(j_global, i_global, val);
+                        for (int r = 0; r < tile_i; ++r) {
+                            const int dst = tile_row_idx[static_cast<size_t>(r)];
+                            if (dst < 0) continue;
+                            update_local_nn(i_start + r, dst, tile_row_best[static_cast<size_t>(r)]);
                         }
-#else
-                        for (int c = 0; c < tile_j; c++) {
-                            const Scalar v =
-                                is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
-                            dist.data[base_idx + c] =
-                                static_cast<SymDistScalar>(v);
-                            const int j_global = tp.j_start + c;
-                            const double val = static_cast<double>(v);
-                            update_local_nn(i_global, j_global, val);
-                            update_local_nn(j_global, i_global, val);
+                        for (int c = 0; c < tile_j; ++c) {
+                            const int dst = tile_col_idx[static_cast<size_t>(c)];
+                            if (dst < 0) continue;
+                            update_local_nn(j_start + c, dst, tile_col_best[static_cast<size_t>(c)]);
                         }
-#endif
                     }
                 }
             }
