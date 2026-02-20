@@ -5,24 +5,29 @@ set -e
 
 # Directory where Eigen should be installed
 EIGEN_DIR=/usr/local/include/eigen3
+EIGEN_VER="3.4.1"
+EIGEN_ARCHIVE="eigen-${EIGEN_VER}.zip"
+EIGEN_SRC_DIR="eigen-${EIGEN_VER}"
+EIGEN_URL="https://gitlab.com/libeigen/eigen/-/archive/${EIGEN_VER}/${EIGEN_ARCHIVE}"
+MAKE_JOBS="${MAKE_JOBS:-$(nproc 2>/dev/null || echo 1)}"
 
 # Check if Eigen is already installed
 if [ ! -d "$EIGEN_DIR" ]; then
   # Download Eigen
-  curl -OL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip
+  curl -OL "$EIGEN_URL"
 
   # Unzip Eigen
-  unzip eigen-3.4.0.zip
+  unzip "$EIGEN_ARCHIVE"
 
   # Create build directory
-  mkdir eigen-3.4.0/build
-  cd eigen-3.4.0/build
+  mkdir "$EIGEN_SRC_DIR/build"
+  cd "$EIGEN_SRC_DIR/build"
 
   # Configure
   cmake ..
 
   # Install
-  make install
+  make -j"$MAKE_JOBS" install
 else
   echo "Eigen is already installed at $EIGEN_DIR."
 fi
