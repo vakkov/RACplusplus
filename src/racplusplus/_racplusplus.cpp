@@ -1388,6 +1388,47 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                         std::fill_n(tile_row_idx.data(), static_cast<size_t>(tile_i), -1);
                         std::fill_n(tile_col_best.data(), static_cast<size_t>(tile_j), inf);
                         std::fill_n(tile_col_idx.data(), static_cast<size_t>(tile_j), -1);
+#if defined(RACPP_SPLIT_STORE_NN) && RACPP_SPLIT_STORE_NN
+                        // Split mode: write the tile first, then do an NN-only pass.
+                        // This is controlled by CMake flag RACPP_SPLIT_STORE_NN.
+                        for (int r = 0; r < tile_i; r++) {
+                            const int i_global = i_start + r;
+                            const size_t base_idx =
+                                dist.row_start[static_cast<size_t>(i_global)] +
+                                static_cast<size_t>(j_start - i_global - 1);
+                            if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
+                                for (int c = 0; c < tile_j; c++) {
+                                    const Scalar v = metric_add + metric_mul * tile(r, c);
+                                    dist.data[base_idx + c] = v;
+                                }
+                            } else {
+                                for (int c = 0; c < tile_j; c++) {
+                                    const Scalar v = metric_add + metric_mul * tile(r, c);
+                                    dist.data[base_idx + c] = static_cast<SymDistScalar>(v);
+                                }
+                            }
+                        }
+                        for (int r = 0; r < tile_i; r++) {
+                            const int i_global = i_start + r;
+                            double& best_i = tile_row_best[static_cast<size_t>(r)];
+                            int& idx_i = tile_row_idx[static_cast<size_t>(r)];
+                            for (int c = 0; c < tile_j; c++) {
+                                const int j_global = j_start + c;
+                                const Scalar v = metric_add + metric_mul * tile(r, c);
+                                const double val = static_cast<double>(v);
+                                if (val < best_i || (val == best_i && (idx_i == -1 || j_global < idx_i))) {
+                                    best_i = val;
+                                    idx_i = j_global;
+                                }
+                                double& best_j = tile_col_best[static_cast<size_t>(c)];
+                                int& idx_j = tile_col_idx[static_cast<size_t>(c)];
+                                if (val < best_j || (val == best_j && (idx_j == -1 || i_global < idx_j))) {
+                                    best_j = val;
+                                    idx_j = i_global;
+                                }
+                            }
+                        }
+#else
                         for (int r = 0; r < tile_i; r++) {
                             const int i_global = i_start + r;
                             const size_t base_idx =
@@ -1434,6 +1475,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                                 }
                             }
                         }
+#endif
                         for (int r = 0; r < tile_i; ++r) {
                             const int dst = tile_row_idx[static_cast<size_t>(r)];
                             if (dst < 0) continue;
