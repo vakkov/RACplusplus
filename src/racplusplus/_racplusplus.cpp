@@ -1248,6 +1248,9 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
     const int D = static_cast<int>(base_arr.rows());
     const int TILE = racpp_dense_init_tile_size();
     const bool is_cosine = (distance_metric == "cosine");
+    // Hoist metric transform once so inner element loops stay branch-free.
+    const Scalar metric_mul = is_cosine ? Scalar(-1) : Scalar(1);
+    const Scalar metric_add = is_cosine ? Scalar(1) : Scalar(0);
     const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(Eigen::nbThreads()));
 
     SymDistMatrix dist(N);
@@ -1334,8 +1337,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                                 dist.row_start[static_cast<size_t>(i_global)];
                             if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
                                 for (int c = c_start; c < tile_j; c++) {
-                                    const Scalar v =
-                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    const Scalar v = metric_add + metric_mul * tile(r, c);
                                     dist.data[base_idx + (c - c_start)] = v;
                                     const int j_global = j_start + c;
                                     const double val = static_cast<double>(v);
@@ -1354,8 +1356,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                                 }
                             } else {
                                 for (int c = c_start; c < tile_j; c++) {
-                                    const Scalar v =
-                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    const Scalar v = metric_add + metric_mul * tile(r, c);
                                     dist.data[base_idx + (c - c_start)] =
                                         static_cast<SymDistScalar>(v);
                                     const int j_global = j_start + c;
@@ -1394,8 +1395,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                                 static_cast<size_t>(j_start - i_global - 1);
                             if constexpr (std::is_same_v<Scalar, SymDistScalar>) {
                                 for (int c = 0; c < tile_j; c++) {
-                                    const Scalar v =
-                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    const Scalar v = metric_add + metric_mul * tile(r, c);
                                     dist.data[base_idx + c] = v;
                                     const int j_global = j_start + c;
                                     const double val = static_cast<double>(v);
@@ -1414,8 +1414,7 @@ static SymDistMatrix calculate_initial_dissimilarities_dense(
                                 }
                             } else {
                                 for (int c = 0; c < tile_j; c++) {
-                                    const Scalar v =
-                                        is_cosine ? (Scalar(1) - tile(r, c)) : tile(r, c);
+                                    const Scalar v = metric_add + metric_mul * tile(r, c);
                                     dist.data[base_idx + c] =
                                         static_cast<SymDistScalar>(v);
                                     const int j_global = j_start + c;
@@ -1507,80 +1506,109 @@ void calculate_initial_dissimilarities(
     const size_t requested_threads =
         std::max<size_t>(1, static_cast<size_t>(Eigen::nbThreads()));
 
-    auto process_cluster = [&](int i) {
-        Cluster& cluster = clusters[i];
-        auto base_col = base_arr.col(i);
+    auto process_batches = [&](auto&& process_cluster) {
+        for (int batchStart = 0; batchStart < clustersSize; batchStart += batch_size) {
+            int batchEnd = std::min(batchStart + batch_size, clustersSize);
+            const int batchCount = batchEnd - batchStart;
+            const size_t no_threads = std::min(requested_threads, static_cast<size_t>(batchCount));
 
-        std::vector<std::pair<int, double>> neighbors;
-
-        int nearest_neighbor = -1;
-        double min = std::numeric_limits<double>::infinity();
-
-        auto update_nn = [&](double distance, int j) {
-            if (distance < min || (distance == min && (nearest_neighbor == -1 || j < nearest_neighbor))) {
-                min = distance;
-                nearest_neighbor = j;
-            }
-        };
-
-        for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
-            int j = it.index();
-            bool value = it.value();
-
-            if (j != i && value) {
-                const double dot = base_col.dot(base_arr.col(j));
-                double distance = 0.0;
-                if (is_cosine) {
-                    distance = 1.0 - dot;
-                } else {
-                    double sq_dist = sq_norms[i] + sq_norms[j] - 2.0 * dot;
-                    if (sq_dist < 0.0) {
-                        sq_dist = 0.0;
-                    }
-                    distance = std::sqrt(sq_dist);
+            if (no_threads <= 1 || batchCount < 64) {
+                for (int i = batchStart; i < batchEnd; ++i) {
+                    process_cluster(i);
                 }
+                continue;
+            }
 
+            std::vector<std::thread> threads;
+            threads.reserve(no_threads);
+
+            size_t chunk_size = static_cast<size_t>(batchCount) / no_threads;
+            size_t remainder = static_cast<size_t>(batchCount) % no_threads;
+            int start = batchStart;
+            for (size_t t = 0; t < no_threads; t++) {
+                int end = start + static_cast<int>(chunk_size) + (t < remainder ? 1 : 0);
+                threads.emplace_back([&process_cluster, start, end]() {
+                    for (int i = start; i < end; ++i) {
+                        process_cluster(i);
+                    }
+                });
+                start = end;
+            }
+
+            for (auto& thread : threads) {
+                thread.join();
+            }
+        }
+    };
+
+    // Dispatch once by metric; avoid per-neighbor metric checks in sparse loops.
+    if (is_cosine) {
+        auto process_cluster = [&](int i) {
+            Cluster& cluster = clusters[i];
+            auto base_col = base_arr.col(i);
+
+            std::vector<std::pair<int, double>> neighbors;
+            int nearest_neighbor = -1;
+            double min = std::numeric_limits<double>::infinity();
+
+            auto update_nn = [&](double distance, int j) {
+                if (distance < min || (distance == min && (nearest_neighbor == -1 || j < nearest_neighbor))) {
+                    min = distance;
+                    nearest_neighbor = j;
+                }
+            };
+
+            for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
+                const int j = it.index();
+                const bool value = it.value();
+                if (j == i || !value) continue;
+
+                const double distance = 1.0 - base_col.dot(base_arr.col(j));
                 neighbors.push_back(std::make_pair(j, distance));
                 update_nn(distance, j);
             }
-        }
 
-        cluster.neighbor_distances = std::move(neighbors);
-        cluster.nn = (min < max_merge_distance) ? nearest_neighbor : -1;
-        cluster.nn_distance = min;
-    };
+            cluster.neighbor_distances = std::move(neighbors);
+            cluster.nn = (min < max_merge_distance) ? nearest_neighbor : -1;
+            cluster.nn_distance = min;
+        };
+        process_batches(process_cluster);
+    } else {
+        auto process_cluster = [&](int i) {
+            Cluster& cluster = clusters[i];
+            auto base_col = base_arr.col(i);
 
-    for (int batchStart = 0; batchStart < clustersSize; batchStart += batch_size) {
-        int batchEnd = std::min(batchStart + batch_size, clustersSize);
-        const int batchCount = batchEnd - batchStart;
-        const size_t no_threads = std::min(requested_threads, static_cast<size_t>(batchCount));
+            std::vector<std::pair<int, double>> neighbors;
+            int nearest_neighbor = -1;
+            double min = std::numeric_limits<double>::infinity();
 
-        if (no_threads <= 1 || batchCount < 64) {
-            for (int i = batchStart; i < batchEnd; ++i) {
-                process_cluster(i);
-            }
-            continue;
-        }
-
-        std::vector<std::thread> threads;
-        threads.reserve(no_threads);
-
-        size_t chunk_size = static_cast<size_t>(batchCount) / no_threads;
-        size_t remainder = static_cast<size_t>(batchCount) % no_threads;
-        int start = batchStart;
-        for (size_t t = 0; t < no_threads; t++) {
-            int end = start + static_cast<int>(chunk_size) + (t < remainder ? 1 : 0);
-            threads.emplace_back([&process_cluster, start, end]() {
-                for (int i = start; i < end; ++i) {
-                    process_cluster(i);
+            auto update_nn = [&](double distance, int j) {
+                if (distance < min || (distance == min && (nearest_neighbor == -1 || j < nearest_neighbor))) {
+                    min = distance;
+                    nearest_neighbor = j;
                 }
-            });
-            start = end;
-        }
+            };
 
-        for (auto& thread : threads) {
-            thread.join();
-        }
+            for (Eigen::SparseMatrix<bool>::InnerIterator it(connectivity, i); it; ++it) {
+                const int j = it.index();
+                const bool value = it.value();
+                if (j == i || !value) continue;
+
+                const double dot = base_col.dot(base_arr.col(j));
+                double sq_dist = sq_norms[i] + sq_norms[j] - 2.0 * dot;
+                if (sq_dist < 0.0) {
+                    sq_dist = 0.0;
+                }
+                const double distance = std::sqrt(sq_dist);
+                neighbors.push_back(std::make_pair(j, distance));
+                update_nn(distance, j);
+            }
+
+            cluster.neighbor_distances = std::move(neighbors);
+            cluster.nn = (min < max_merge_distance) ? nearest_neighbor : -1;
+            cluster.nn_distance = min;
+        };
+        process_batches(process_cluster);
     }
 }
 
