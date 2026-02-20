@@ -5,7 +5,7 @@ set -e
 
 # Directory where Eigen should be installed
 EIGEN_DIR=/usr/local/include/eigen3
-EIGEN_VER="3.4.1"
+EIGEN_VER="5.0.1"
 EIGEN_ARCHIVE="eigen-${EIGEN_VER}.zip"
 EIGEN_SRC_DIR="eigen-${EIGEN_VER}"
 EIGEN_URL="https://gitlab.com/libeigen/eigen/-/archive/${EIGEN_VER}/${EIGEN_ARCHIVE}"
