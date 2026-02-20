@@ -2381,28 +2381,69 @@ void update_cluster_nn_dist(
                 const int max_cid = tile_cids[B - 1];
 
                 // Pass 1: k < min_cid (shared row traversal across tile).
-                for (size_t r = 0; r < scan_run_count; ++r) {
-                    const ScanRun& run = scan_run_data[r];
-                    if (run.k_start >= min_cid) break;
-                    const int k1 = std::min(run.k_end, min_cid - 1);
-                    for (int k = run.k_start; k <= k1; ++k) {
+                // When tile cids are consecutive (common after compaction),
+                // the B reads per row are contiguous → use direct pointer
+                // stride instead of indexed loads through tile_cids[b].
+                const bool cids_consecutive =
+                    (B == TILE_B) &&
+                    (tile_cids[B - 1] - tile_cids[0] == static_cast<int>(B) - 1);
+                if (cids_consecutive) {
+                    const int base_cid = tile_cids[0];
+                    for (size_t r = 0; r < scan_run_count; ++r) {
+                        const ScanRun& run = scan_run_data[r];
+                        if (run.k_start >= min_cid) break;
+                        const int k1 = std::min(run.k_end, min_cid - 1);
+                        for (int k = run.k_start; k <= k1; ++k) {
 #if defined(__GNUC__) || defined(__clang__)
-                        constexpr int PREFETCH_AHEAD = 2;
-                        if (k + PREFETCH_AHEAD <= k1) {
-                            const SymDistScalar* row_pf =
-                                dist_data + row_start[static_cast<size_t>(k + PREFETCH_AHEAD)];
-                            __builtin_prefetch(row_pf, 0, 1);
-                        }
+                            constexpr int PA = 4;
+                            if (k + PA <= k1) {
+                                const SymDistScalar* pf =
+                                    dist_data +
+                                    row_start[static_cast<size_t>(k + PA)] +
+                                    static_cast<size_t>(base_cid - (k + PA) - 1);
+                                __builtin_prefetch(pf, 0, 1);
+                                __builtin_prefetch(pf + 16, 0, 1);
+                            }
 #endif
-                        const SymDistScalar* row_k =
-                            dist_data + row_start[static_cast<size_t>(k)];
-                        for (size_t b = 0; b < B; ++b) {
-                            const int cid = tile_cids[b];
-                            const SymDistScalar v =
-                                row_k[static_cast<size_t>(cid - k - 1)];
-                            if (v < tile_best[b]) {
-                                tile_best[b] = v;
-                                tile_best_idx[b] = k;
+                            const SymDistScalar* src =
+                                dist_data +
+                                row_start[static_cast<size_t>(k)] +
+                                static_cast<size_t>(base_cid - k - 1);
+                            for (size_t b = 0; b < B; ++b) {
+                                const SymDistScalar v = src[b];
+                                if (v < tile_best[b]) {
+                                    tile_best[b] = v;
+                                    tile_best_idx[b] = k;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (size_t r = 0; r < scan_run_count; ++r) {
+                        const ScanRun& run = scan_run_data[r];
+                        if (run.k_start >= min_cid) break;
+                        const int k1 = std::min(run.k_end, min_cid - 1);
+                        for (int k = run.k_start; k <= k1; ++k) {
+#if defined(__GNUC__) || defined(__clang__)
+                            constexpr int PA = 4;
+                            if (k + PA <= k1) {
+                                const SymDistScalar* pf =
+                                    dist_data +
+                                    row_start[static_cast<size_t>(k + PA)] +
+                                    static_cast<size_t>(tile_cids[0] - (k + PA) - 1);
+                                __builtin_prefetch(pf, 0, 1);
+                            }
+#endif
+                            const SymDistScalar* row_k =
+                                dist_data + row_start[static_cast<size_t>(k)];
+                            for (size_t b = 0; b < B; ++b) {
+                                const int cid = tile_cids[b];
+                                const SymDistScalar v =
+                                    row_k[static_cast<size_t>(cid - k - 1)];
+                                if (v < tile_best[b]) {
+                                    tile_best[b] = v;
+                                    tile_best_idx[b] = k;
+                                }
                             }
                         }
                     }
@@ -2417,11 +2458,15 @@ void update_cluster_nn_dist(
                     const int k1 = std::min(run.k_end, max_cid);
                     for (int k = k0; k <= k1; ++k) {
 #if defined(__GNUC__) || defined(__clang__)
-                        constexpr int PREFETCH_AHEAD = 2;
-                        if (k + PREFETCH_AHEAD <= k1) {
-                            const SymDistScalar* row_pf =
-                                dist_data + row_start[static_cast<size_t>(k + PREFETCH_AHEAD)];
-                            __builtin_prefetch(row_pf, 0, 1);
+                        constexpr int PA = 4;
+                        if (k + PA <= k1) {
+                            // Prefetch near the tile's read region, not the row start.
+                            const SymDistScalar* pf =
+                                dist_data +
+                                row_start[static_cast<size_t>(k + PA)] +
+                                static_cast<size_t>(
+                                    std::max(min_cid, k + PA + 1) - (k + PA) - 1);
+                            __builtin_prefetch(pf, 0, 1);
                         }
 #endif
                         const SymDistScalar* row_k =
