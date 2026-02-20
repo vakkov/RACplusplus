@@ -2774,40 +2774,40 @@ void RAC_i(
                 orig_dsu_parent = dsu_parent;
             }
 
-            // Build compact distance matrix (parallel by row).
-            // Direct data access: sorted_active is sorted so oi < oj always,
-            // avoiding dist.get()'s equality check + conditional swap per element.
-            SymDistMatrix new_dist(A);
+            // IMPORTANT (memory safety): keep compaction in-place.
+            // Do NOT reintroduce `SymDistMatrix new_dist(A)` here.
+            // Allocating old+new simultaneously causes a large transient RSS spike
+            // (for ~98k points, ~19GB old matrix + ~6GB compact matrix => >25GB peak).
+            //
+            // In-place copy is safe because for sorted_active, each source triangular index
+            // is >= destination index:
+            // tri_old(oi,oj) - tri_new(i,j) = i*(old_N - A) + extra >= 0.
+            // Therefore a forward write order cannot overwrite unread source elements.
             {
-                const SymDistScalar* old_data = dist.data.data();
+                SymDistScalar* data = dist.data.data();
                 const size_t* old_row_start = dist.row_start.data();
-                SymDistScalar* new_data = new_dist.data.data();
-                const size_t* new_row_start = new_dist.row_start.data();
                 const int* sa = sorted_active.data();
-
-                auto copy_range = [&](size_t start, size_t end) {
-                    for (size_t i = start; i < end; i++) {
-                        const int oi = sa[i];
-                        const size_t old_base = old_row_start[static_cast<size_t>(oi)];
-                        const size_t new_base = new_row_start[i];
-                        for (size_t j = i + 1; j < static_cast<size_t>(A); j++) {
-                            const int oj = sa[j];
-                            // oi < oj guaranteed (sorted_active is sorted)
-                            new_data[new_base + (j - i - 1)] =
-                                old_data[old_base + static_cast<size_t>(oj - oi - 1)];
-                        }
+                size_t dst = 0;
+                for (size_t i = 0; i < static_cast<size_t>(A); ++i) {
+                    const int oi = sa[i];
+                    const size_t old_base = old_row_start[static_cast<size_t>(oi)];
+                    for (size_t j = i + 1; j < static_cast<size_t>(A); ++j) {
+                        const int oj = sa[j];
+                        data[dst++] = data[old_base + static_cast<size_t>(oj - oi - 1)];
                     }
-                };
+                }
 
-                const size_t req = (NO_PROCESSORS > 0) ? static_cast<size_t>(NO_PROCESSORS) : 1;
-                const size_t nt = std::min(req, static_cast<size_t>(A));
-                if (nt <= 1) {
-                    copy_range(0, A);
-                } else {
-                    run_parallel_for(req, static_cast<size_t>(A), copy_range);
+                const size_t new_size =
+                    static_cast<size_t>(A) * static_cast<size_t>(A - 1) / 2;
+                dist.N = A;
+                dist.data.resize(new_size);
+                dist.row_start.resize(static_cast<size_t>(A));
+                for (int i = 0; i < A; ++i) {
+                    dist.row_start[static_cast<size_t>(i)] =
+                        static_cast<size_t>(i) * static_cast<size_t>(A)
+                        - static_cast<size_t>(i) * static_cast<size_t>(i + 1) / 2;
                 }
             }
-            dist = std::move(new_dist);
 
             // Rebuild clusters with compact IDs.
             std::vector<Cluster> new_clusters;
