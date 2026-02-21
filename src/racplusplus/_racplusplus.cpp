@@ -108,6 +108,26 @@ static inline int racpp_dense_init_tile_size() {
     return cached_tile;
 }
 
+static inline size_t racpp_nn_rescan_chunk_hint() {
+    // Default chunk is 32. Set RACPP_NN_RESCAN_CHUNK to override.
+    // Use RACPP_NN_RESCAN_CHUNK=0 to fall back to auto-size from workload.
+    static size_t cached = std::numeric_limits<size_t>::max();
+    if (cached != std::numeric_limits<size_t>::max()) {
+        return cached;
+    }
+
+    size_t hint = 32;
+    if (const char* env = std::getenv("RACPP_NN_RESCAN_CHUNK")) {
+        char* end_ptr = nullptr;
+        const long parsed = std::strtol(env, &end_ptr, 10);
+        if (end_ptr != env && parsed >= 0) {
+            hint = static_cast<size_t>(parsed);
+        }
+    }
+    cached = hint;
+    return cached;
+}
+
 #if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
     defined(__AVX2__) && defined(__FMA__) && \
     defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
@@ -118,6 +138,26 @@ static inline float hmin_ps256(__m256 v) {
     m = _mm_min_ps(m, _mm_movehl_ps(m, m));
     m = _mm_min_ps(m, _mm_shuffle_ps(m, m, 0x55));
     return _mm_cvtss_f32(m);
+}
+
+static inline void update_min_block8(
+    const SymDistScalar* values,
+    int k,
+    SymDistScalar* best,
+    int* best_idx) {
+    static_assert(std::is_same_v<SymDistScalar, float>,
+                  "update_min_block8 requires float SymDistScalar");
+    const __m256 v = _mm256_loadu_ps(values);
+    const __m256 b = _mm256_loadu_ps(best);
+    const __m256 mask = _mm256_cmp_ps(v, b, _CMP_LT_OQ);
+    _mm256_storeu_ps(best, _mm256_blendv_ps(b, v, mask));
+
+    const __m256i idx_old =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(best_idx));
+    const __m256i idx_new = _mm256_set1_epi32(k);
+    const __m256i idx_blend =
+        _mm256_blendv_epi8(idx_old, idx_new, _mm256_castps_si256(mask));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(best_idx), idx_blend);
 }
 #endif
 
@@ -2479,6 +2519,25 @@ void update_cluster_nn_dist(
                                 dist_data +
                                 row_start[static_cast<size_t>(k)] +
                                 static_cast<size_t>(base_cid - k - 1);
+#if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
+    defined(__AVX2__) && defined(__FMA__) && \
+    defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+                            size_t b = 0;
+                            for (; b + 7 < B; b += 8) {
+                                update_min_block8(
+                                    src + b,
+                                    k,
+                                    tile_best.data() + b,
+                                    tile_best_idx.data() + b);
+                            }
+                            for (; b < B; ++b) {
+                                const SymDistScalar v = src[b];
+                                if (v < tile_best[b]) {
+                                    tile_best[b] = v;
+                                    tile_best_idx[b] = k;
+                                }
+                            }
+#else
                             for (size_t b = 0; b < B; ++b) {
                                 const SymDistScalar v = src[b];
                                 if (v < tile_best[b]) {
@@ -2486,6 +2545,7 @@ void update_cluster_nn_dist(
                                     tile_best_idx[b] = k;
                                 }
                             }
+#endif
                         }
                     }
                 } else {
@@ -2520,37 +2580,108 @@ void update_cluster_nn_dist(
                 }
 
                 // Pass 2: min_cid <= k <= max_cid (small overlap region).
-                for (size_t r = 0; r < scan_run_count; ++r) {
-                    const ScanRun& run = scan_run_data[r];
-                    if (run.k_end < min_cid) continue;
-                    if (run.k_start > max_cid) break;
-                    const int k0 = std::max(run.k_start, min_cid);
-                    const int k1 = std::min(run.k_end, max_cid);
-                    for (int k = k0; k <= k1; ++k) {
+                if (cids_consecutive) {
+                    const int base_cid = tile_cids[0];
+                    for (size_t r = 0; r < scan_run_count; ++r) {
+                        const ScanRun& run = scan_run_data[r];
+                        if (run.k_end < min_cid) continue;
+                        if (run.k_start > max_cid) break;
+                        const int k0 = std::max(run.k_start, min_cid);
+                        const int k1 = std::min(run.k_end, max_cid);
+                        for (int k = k0; k <= k1; ++k) {
 #if defined(__GNUC__) || defined(__clang__)
-                        constexpr int PA = 4;
-                        if (k + PA <= k1) {
-                            // Prefetch near the tile's read region, not the row start.
-                            const SymDistScalar* pf =
-                                dist_data +
-                                row_start[static_cast<size_t>(k + PA)] +
-                                static_cast<size_t>(
-                                    std::max(min_cid, k + PA + 1) - (k + PA) - 1);
-                            __builtin_prefetch(pf, 0, 1);
-                        }
+                            constexpr int PA = 4;
+                            if (k + PA <= k1) {
+                                // Prefetch near the tile's read region, not the row start.
+                                const SymDistScalar* pf =
+                                    dist_data +
+                                    row_start[static_cast<size_t>(k + PA)] +
+                                    static_cast<size_t>(
+                                        std::max(min_cid, k + PA + 1) - (k + PA) - 1);
+                                __builtin_prefetch(pf, 0, 1);
+                            }
 #endif
-                        const SymDistScalar* row_k =
-                            dist_data + row_start[static_cast<size_t>(k)];
-                        for (size_t b = 0; b < B; ++b) {
-                            const int cid = tile_cids[b];
-                            if (k == cid) continue;
-                            const SymDistScalar v = (k < cid)
-                                ? row_k[static_cast<size_t>(cid - k - 1)]
-                                : dist_data[tile_cid_bases[b] +
-                                            static_cast<size_t>(k - cid - 1)];
-                            if (v < tile_best[b]) {
-                                tile_best[b] = v;
-                                tile_best_idx[b] = k;
+                            const SymDistScalar* row_k =
+                                dist_data + row_start[static_cast<size_t>(k)];
+                            const int eq_b = k - base_cid;  // lane where cid == k
+
+                            // Lower segment: cid < k (reads from each cid-tail row).
+                            for (int b = 0; b < eq_b; ++b) {
+                                const int cid = base_cid + b;
+                                const SymDistScalar v =
+                                    dist_data[tile_cid_bases[static_cast<size_t>(b)] +
+                                              static_cast<size_t>(k - cid - 1)];
+                                if (v < tile_best[static_cast<size_t>(b)]) {
+                                    tile_best[static_cast<size_t>(b)] = v;
+                                    tile_best_idx[static_cast<size_t>(b)] = k;
+                                }
+                            }
+
+                            // Upper segment: cid > k, contiguous in row_k.
+                            const size_t upper_b = static_cast<size_t>(eq_b + 1);
+#if defined(RACPP_SIMD_NN_TAIL_UPDATE) && RACPP_SIMD_NN_TAIL_UPDATE && \
+    defined(__AVX2__) && defined(__FMA__) && \
+    defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
+                            size_t b = upper_b;
+                            for (; b + 7 < B; b += 8) {
+                                const size_t src_off = b - upper_b;
+                                update_min_block8(
+                                    row_k + src_off,
+                                    k,
+                                    tile_best.data() + b,
+                                    tile_best_idx.data() + b);
+                            }
+                            for (; b < B; ++b) {
+                                const SymDistScalar v = row_k[b - upper_b];
+                                if (v < tile_best[b]) {
+                                    tile_best[b] = v;
+                                    tile_best_idx[b] = k;
+                                }
+                            }
+#else
+                            for (size_t b = upper_b; b < B; ++b) {
+                                const SymDistScalar v = row_k[b - upper_b];
+                                if (v < tile_best[b]) {
+                                    tile_best[b] = v;
+                                    tile_best_idx[b] = k;
+                                }
+                            }
+#endif
+                        }
+                    }
+                } else {
+                    for (size_t r = 0; r < scan_run_count; ++r) {
+                        const ScanRun& run = scan_run_data[r];
+                        if (run.k_end < min_cid) continue;
+                        if (run.k_start > max_cid) break;
+                        const int k0 = std::max(run.k_start, min_cid);
+                        const int k1 = std::min(run.k_end, max_cid);
+                        for (int k = k0; k <= k1; ++k) {
+#if defined(__GNUC__) || defined(__clang__)
+                            constexpr int PA = 4;
+                            if (k + PA <= k1) {
+                                // Prefetch near the tile's read region, not the row start.
+                                const SymDistScalar* pf =
+                                    dist_data +
+                                    row_start[static_cast<size_t>(k + PA)] +
+                                    static_cast<size_t>(
+                                        std::max(min_cid, k + PA + 1) - (k + PA) - 1);
+                                __builtin_prefetch(pf, 0, 1);
+                            }
+#endif
+                            const SymDistScalar* row_k =
+                                dist_data + row_start[static_cast<size_t>(k)];
+                            for (size_t b = 0; b < B; ++b) {
+                                const int cid = tile_cids[b];
+                                if (k == cid) continue;
+                                const SymDistScalar v = (k < cid)
+                                    ? row_k[static_cast<size_t>(cid - k - 1)]
+                                    : dist_data[tile_cid_bases[b] +
+                                                static_cast<size_t>(k - cid - 1)];
+                                if (v < tile_best[b]) {
+                                    tile_best[b] = v;
+                                    tile_best_idx[b] = k;
+                                }
                             }
                         }
                     }
@@ -2617,7 +2748,27 @@ void update_cluster_nn_dist(
     if (no_threads <= 1) {
         rescan_range(0, count);
     } else {
-        run_parallel_for(requested, count, rescan_range);
+        const size_t hint_chunk = racpp_nn_rescan_chunk_hint();
+        const size_t auto_chunk = std::clamp(
+            (count + no_threads * 16 - 1) / (no_threads * 16),
+            static_cast<size_t>(16),
+            static_cast<size_t>(1024));
+        const size_t chunk = (hint_chunk > 0) ? hint_chunk : auto_chunk;
+
+        std::atomic<size_t> next_chunk_start{0};
+        auto dynamic_rescan_worker = [&](size_t, size_t) {
+            while (true) {
+                const size_t start = next_chunk_start.fetch_add(
+                    chunk, std::memory_order_relaxed);
+                if (start >= count) {
+                    break;
+                }
+                const size_t end = std::min(start + chunk, count);
+                rescan_range(start, end);
+            }
+        };
+        // Use one scheduling task per worker; each worker steals chunks dynamically.
+        run_parallel_for(no_threads, no_threads, dynamic_rescan_worker);
     }
     if (profile_ops) {
         const auto t_rescan_total_1 = std::chrono::high_resolution_clock::now();
