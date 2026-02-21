@@ -2224,19 +2224,28 @@ void update_cluster_nn_dist(
     }
 
     // Map merge main id -> merge batch index.
-    // Needed to validate changed=1 mains against only later-batch mains.
+    // Also build changed-main ids grouped by batch so changed=1 fastpath can
+    // scan only later-batch mains (instead of all changed mains).
+    const size_t merge_batch_count = (merges.size() + MERGE_BATCH - 1) / MERGE_BATCH;
     std::vector<int> main_to_batch(static_cast<size_t>(N), -1);
-    std::vector<int> changed_main_ids;
-    changed_main_ids.reserve(merges.size());
+    std::vector<int> changed_main_ids_by_batch;
+    changed_main_ids_by_batch.reserve(merges.size());
+    std::vector<size_t> changed_main_batch_counts(merge_batch_count, 0);
     for (size_t i = 0; i < merges.size(); ++i) {
         const int mid = merges[i].first;
-        main_to_batch[static_cast<size_t>(mid)] = static_cast<int>(i / MERGE_BATCH);
-        changed_main_ids.push_back(mid);
+        if (main_to_batch[static_cast<size_t>(mid)] != -1) {
+            continue;
+        }
+        const size_t b = i / MERGE_BATCH;
+        main_to_batch[static_cast<size_t>(mid)] = static_cast<int>(b);
+        changed_main_ids_by_batch.push_back(mid);
+        ++changed_main_batch_counts[b];
     }
-    std::sort(changed_main_ids.begin(), changed_main_ids.end());
-    changed_main_ids.erase(
-        std::unique(changed_main_ids.begin(), changed_main_ids.end()),
-        changed_main_ids.end());
+    std::vector<size_t> changed_main_batch_offsets(merge_batch_count + 1, 0);
+    for (size_t b = 0; b < merge_batch_count; ++b) {
+        changed_main_batch_offsets[b + 1] =
+            changed_main_batch_offsets[b] + changed_main_batch_counts[b];
+    }
 
     std::vector<int> needs_rescan;
     needs_rescan.reserve(active_indices.size());
@@ -2417,12 +2426,12 @@ void update_cluster_nn_dist(
                     best_idx = tentative_nn;
                     const size_t cid_base = row_start[static_cast<size_t>(cid)];
 
-                    const size_t changed_main_count = changed_main_ids.size();
-                    for (size_t ck = 0; ck < changed_main_count; ++ck) {
-                        const int k = changed_main_ids[ck];
+                    const size_t later_start = changed_main_batch_offsets[
+                        static_cast<size_t>(my_batch + 1)];
+                    const size_t changed_main_count = changed_main_ids_by_batch.size();
+                    for (size_t ck = later_start; ck < changed_main_count; ++ck) {
+                        const int k = changed_main_ids_by_batch[ck];
                         if (k == cid || !alive[k] || dead[k]) continue;
-                        const int k_batch = main_to_batch[static_cast<size_t>(k)];
-                        if (k_batch <= my_batch) continue;  // only later-batch mains
 
                         const SymDistScalar v = (k < cid)
                             ? dist_data[row_start[static_cast<size_t>(k)] +
