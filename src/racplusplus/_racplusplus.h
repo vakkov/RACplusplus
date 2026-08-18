@@ -8,8 +8,16 @@
 #include <set>
 #include <limits>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include "Eigen/Dense"
 #include "Eigen/Sparse"
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #ifndef GLOBAL_TIMING_VARS_H
 #define GLOBAL_TIMING_VARS_H
@@ -65,16 +73,150 @@ using SymDistScalar = double;
 #endif
 using SymDistVector = Eigen::Matrix<SymDistScalar, Eigen::Dynamic, 1>;
 
+// Owning buffer for the O(N^2/2) distance data. Compared to std::vector it:
+//  - skips value-initialization: every element is written by dense init
+//    before any read, so a fill is pure overhead and concentrates NUMA
+//    first-touch on one thread (the parallel tile writers touch first now);
+//  - requests transparent hugepages (Linux), cutting TLB misses in the
+//    row-hopping NN scans over multi-GB buffers;
+//  - returns tail pages to the OS when shrunk (Linux), so RSS drops after
+//    each compaction instead of holding the initial peak for the whole run
+//    (vector::resize never releases capacity; shrink_to_fit would copy and
+//    transiently double RSS).
+// Move-only. Non-Linux builds fall back to malloc (no-init still applies;
+// shrink keeps memory, matching the old vector behavior).
+class SymDistBuffer {
+public:
+    SymDistBuffer() = default;
+    explicit SymDistBuffer(size_t count) { allocate(count); }
+
+    SymDistBuffer(const SymDistBuffer&) = delete;
+    SymDistBuffer& operator=(const SymDistBuffer&) = delete;
+
+    SymDistBuffer(SymDistBuffer&& other) noexcept
+        : ptr_(other.ptr_), size_(other.size_), mapped_bytes_(other.mapped_bytes_) {
+        other.ptr_ = nullptr;
+        other.size_ = 0;
+        other.mapped_bytes_ = 0;
+    }
+    SymDistBuffer& operator=(SymDistBuffer&& other) noexcept {
+        if (this != &other) {
+            release();
+            ptr_ = other.ptr_;
+            size_ = other.size_;
+            mapped_bytes_ = other.mapped_bytes_;
+            other.ptr_ = nullptr;
+            other.size_ = 0;
+            other.mapped_bytes_ = 0;
+        }
+        return *this;
+    }
+
+    ~SymDistBuffer() { release(); }
+
+    SymDistScalar* data() { return ptr_; }
+    const SymDistScalar* data() const { return ptr_; }
+    size_t size() const { return size_; }
+
+    SymDistScalar& operator[](size_t i) { return ptr_[i]; }
+    const SymDistScalar& operator[](size_t i) const { return ptr_[i]; }
+
+    // Shrink preserves the retained prefix and (on Linux) unmaps the tail.
+    // Grow preserves existing contents (not used in the current algorithm,
+    // kept correct for safety).
+    void resize(size_t count) {
+        if (count == size_) {
+            return;
+        }
+        if (count < size_) {
+#if defined(__linux__)
+            const size_t keep_bytes = round_up_page(count * sizeof(SymDistScalar));
+            if (ptr_ != nullptr && keep_bytes < mapped_bytes_) {
+                if (keep_bytes == 0) {
+                    ::munmap(ptr_, mapped_bytes_);
+                    ptr_ = nullptr;
+                    mapped_bytes_ = 0;
+                } else {
+                    ::munmap(reinterpret_cast<char*>(ptr_) + keep_bytes,
+                             mapped_bytes_ - keep_bytes);
+                    mapped_bytes_ = keep_bytes;
+                }
+            }
+#endif
+            size_ = count;
+            return;
+        }
+        // Grow: fresh allocation, copy retained prefix.
+        SymDistBuffer grown(count);
+        if (ptr_ != nullptr && size_ > 0) {
+            std::memcpy(grown.ptr_, ptr_, size_ * sizeof(SymDistScalar));
+        }
+        *this = std::move(grown);
+    }
+
+private:
+    void allocate(size_t count) {
+        size_ = count;
+        if (count == 0) {
+            return;
+        }
+        const size_t bytes = count * sizeof(SymDistScalar);
+#if defined(__linux__)
+        mapped_bytes_ = round_up_page(bytes);
+        void* p = ::mmap(nullptr, mapped_bytes_, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            throw std::bad_alloc();
+        }
+#if defined(MADV_HUGEPAGE)
+        ::madvise(p, mapped_bytes_, MADV_HUGEPAGE);  // best-effort
+#endif
+        ptr_ = static_cast<SymDistScalar*>(p);
+#else
+        ptr_ = static_cast<SymDistScalar*>(std::malloc(bytes));
+        if (ptr_ == nullptr) {
+            throw std::bad_alloc();
+        }
+        mapped_bytes_ = bytes;
+#endif
+    }
+
+    void release() {
+        if (ptr_ != nullptr) {
+#if defined(__linux__)
+            ::munmap(ptr_, mapped_bytes_);
+#else
+            std::free(ptr_);
+#endif
+            ptr_ = nullptr;
+        }
+        size_ = 0;
+        mapped_bytes_ = 0;
+    }
+
+#if defined(__linux__)
+    static size_t round_up_page(size_t bytes) {
+        static const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+        return (bytes + page - 1) / page * page;
+    }
+#endif
+
+    SymDistScalar* ptr_ = nullptr;
+    size_t size_ = 0;
+    size_t mapped_bytes_ = 0;
+};
+
 class SymDistMatrix {
 public:
     int N;
-    std::vector<SymDistScalar> data;
+    SymDistBuffer data;
     std::vector<size_t> row_start;
 
     explicit SymDistMatrix(int n)
         : N(n),
-          data(static_cast<size_t>(n) * (n - 1) / 2,
-               std::numeric_limits<SymDistScalar>::infinity()),
+          // Uninitialized allocation: dense init writes all N*(N-1)/2 entries
+          // before any read (verified by poison-fill equivalence + valgrind).
+          data(static_cast<size_t>(n) * (static_cast<size_t>(n) - 1) / 2),
           row_start(static_cast<size_t>(n), 0) {
         for (int i = 0; i < N; i++) {
             row_start[static_cast<size_t>(i)] =
