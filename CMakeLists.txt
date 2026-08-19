@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(racplusplus VERSION "0.0.5")
+project(racplusplus VERSION "0.1.3")
 message(STATUS "CC: $ENV{CC}")
 message(STATUS "CXX: $ENV{CXX}")
 option(RACPP_SYMDIST_USE_FLOAT "Store SymDistMatrix values as float32 instead of float64" ON)

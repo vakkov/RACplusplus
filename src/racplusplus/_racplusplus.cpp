@@ -3824,7 +3824,7 @@ PYBIND11_MODULE(_racplusplus, m){
         Simple test function to see if pybind works, and can print text in python.
     )fdoc");
 
-    m.attr("__version__") = "0.9";
+    m.attr("__version__") = "0.1.3";
 #if defined(RACPP_SYMDIST_USE_FLOAT) && RACPP_SYMDIST_USE_FLOAT
     m.attr("__symdist_storage__") = "float32";
 #else
