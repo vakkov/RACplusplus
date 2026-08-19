@@ -3301,17 +3301,29 @@ static std::vector<int> RAC_graph_cosine(
             ++deg[static_cast<size_t>(e.second)];
         }
     }
-    std::vector<std::vector<int>> lists(static_cast<size_t>(N));
+    // Candidate entry with a memoized cluster distance. `ver` is the value of
+    // version[id] when `mean` was computed; the cached mean is reusable only
+    // while neither endpoint has changed since (see recompute_range).
+    struct Cand {
+        int id;
+        uint32_t ver;
+        double mean;
+    };
+    std::vector<std::vector<Cand>> lists(static_cast<size_t>(N));
     for (int i = 0; i < N; ++i) {
         lists[static_cast<size_t>(i)].reserve(static_cast<size_t>(deg[i]));
     }
     for (auto& el : edges_locals) {
         for (const auto& e : el) {
-            lists[static_cast<size_t>(e.first)].push_back(e.second);
-            lists[static_cast<size_t>(e.second)].push_back(e.first);
+            lists[static_cast<size_t>(e.first)].push_back(Cand{e.second, 0u, 0.0});
+            lists[static_cast<size_t>(e.second)].push_back(Cand{e.first, 0u, 0.0});
         }
         std::vector<std::pair<int, int>>().swap(el);
     }
+    // version[c] increments whenever c's contents change (i.e. c absorbs
+    // another cluster), invalidating every cached distance that involves c.
+    // Starts at 1 so the zero-initialized entries above always miss.
+    std::vector<uint32_t> version(static_cast<size_t>(N), 1u);
 
     std::vector<Cluster> clusters;
     clusters.reserve(N);
@@ -3330,22 +3342,31 @@ static std::vector<int> RAC_graph_cosine(
     std::vector<char> is_dead(static_cast<size_t>(N), 0);
 
     // Shared NN evaluation kernel: resolve, dedup, prune (mean >= T),
-    // min-reduce with smallest-id tie-break. This is the ONLY arithmetic that
-    // ever produces an NN value — initial NNs use it too, so every pair is
-    // evaluated identically by both endpoints at equal merge state. (Mixing
-    // value systems, e.g. float tile dots at init vs double closed form on
-    // rescans, breaks the guarantee that a reciprocal pair always exists and
-    // can deadlock the merge loop on near-tie duplicate cliques.)
+    // min-reduce with smallest-id tie-break. All distances come from ONE
+    // arithmetic expression (the double closed form) so both endpoints of a
+    // pair always agree on its value. (Mixing value systems — e.g. float tile
+    // dots at init vs closed form on rescans, or Lance-Williams updates mixed
+    // with closed-form values — breaks the guarantee that a reciprocal pair
+    // exists and can deadlock the merge loop on near-tie duplicate cliques.)
+    //
+    // Cached values are a pure memoization of that same expression: an entry
+    // is reused only when neither endpoint changed since it was computed, so
+    // a reused value is bit-identical to recomputing it. Cluster x's whole
+    // list is invalidated when x itself absorbs another cluster; individual
+    // entries are invalidated by version[id].
+    std::atomic<uint64_t> stat_cache_hits{0}, stat_cache_miss{0};
     std::vector<int> needs_rescan;
     needs_rescan.reserve(static_cast<size_t>(N));
     auto recompute_range = [&](size_t start, size_t end) {
         thread_local std::vector<long long> mark;
         thread_local long long stamp = 0;
         if (static_cast<int>(mark.size()) < N) mark.assign(static_cast<size_t>(N), -1);
+        uint64_t local_hits = 0, local_miss = 0;
         for (size_t q = start; q < end; ++q) {
             const int cid = needs_rescan[q];
-            std::vector<int>& lst = lists[static_cast<size_t>(cid)];
+            std::vector<Cand>& lst = lists[static_cast<size_t>(cid)];
             ++stamp;
+            const bool self_changed = (is_changed[static_cast<size_t>(cid)] != 0);
             const double sz_x = static_cast<double>(dsu_size[static_cast<size_t>(cid)]);
             Eigen::Map<const Eigen::VectorXd> sx(
                 sums.data() + static_cast<size_t>(cid) * D, D);
@@ -3353,17 +3374,27 @@ static std::vector<int> RAC_graph_cosine(
             int best_idx = -1;
             size_t wr = 0;
             for (size_t p = 0; p < lst.size(); ++p) {
-                const int r = dsu_find_ro(dsu_parent, lst[p]);
+                const Cand& in = lst[p];
+                const int r = dsu_find_ro(dsu_parent, in.id);
                 if (r == cid || !alive[static_cast<size_t>(r)]) continue;
                 if (mark[static_cast<size_t>(r)] == stamp) continue;
                 mark[static_cast<size_t>(r)] = stamp;
-                Eigen::Map<const Eigen::VectorXd> sr(
-                    sums.data() + static_cast<size_t>(r) * D, D);
-                const double mean =
-                    1.0 - sx.dot(sr) /
-                              (sz_x * static_cast<double>(dsu_size[static_cast<size_t>(r)]));
+
+                const uint32_t rver = version[static_cast<size_t>(r)];
+                double mean;
+                if (!self_changed && r == in.id && in.ver == rver) {
+                    mean = in.mean;              // both endpoints unchanged
+                    ++local_hits;
+                } else {
+                    Eigen::Map<const Eigen::VectorXd> sr(
+                        sums.data() + static_cast<size_t>(r) * D, D);
+                    mean = 1.0 - sx.dot(sr) /
+                                     (sz_x * static_cast<double>(
+                                                 dsu_size[static_cast<size_t>(r)]));
+                    ++local_miss;
+                }
                 if (mean < T) {
-                    lst[wr++] = r;
+                    lst[wr++] = Cand{r, rver, mean};
                     if (mean < best ||
                         (mean == best && (best_idx == -1 || r < best_idx))) {
                         best = mean;
@@ -3376,6 +3407,8 @@ static std::vector<int> RAC_graph_cosine(
             clusters[static_cast<size_t>(cid)].nn_distance =
                 (best_idx != -1) ? best : inf;
         }
+        stat_cache_hits.fetch_add(local_hits, std::memory_order_relaxed);
+        stat_cache_miss.fetch_add(local_miss, std::memory_order_relaxed);
     };
 
     // Initial NN pass over every point that has edges, using the kernel.
@@ -3408,8 +3441,9 @@ static std::vector<int> RAC_graph_cosine(
             auto& lm = lists[static_cast<size_t>(main_id)];
             auto& ls = lists[static_cast<size_t>(sec_id)];
             lm.insert(lm.end(), ls.begin(), ls.end());
-            std::vector<int>().swap(ls);
+            std::vector<Cand>().swap(ls);
             dsu_union(dsu_parent, dsu_size, main_id, sec_id);
+            ++version[static_cast<size_t>(main_id)];
             is_changed[static_cast<size_t>(main_id)] = 1;
             is_dead[static_cast<size_t>(sec_id)] = 1;
         }
@@ -3451,10 +3485,15 @@ static std::vector<int> RAC_graph_cosine(
         ++iterations;
     }
 
+    const uint64_t hits = stat_cache_hits.load(std::memory_order_relaxed);
+    const uint64_t miss = stat_cache_miss.load(std::memory_order_relaxed);
     std::cerr << "RAC_graph iterations: " << iterations
               << " | merge+build: " << total_merge_ms << "ms"
               << " | nn_recompute: " << total_nn_ms << "ms"
-              << " | find+remove: " << total_find_ms << "ms" << std::endl;
+              << " | find+remove: " << total_find_ms << "ms"
+              << " | cache hit/miss: " << hits << "/" << miss
+              << " (" << (hits + miss ? 100.0 * hits / (hits + miss) : 0.0)
+              << "%)" << std::endl;
 
     std::vector<int> cluster_labels(static_cast<size_t>(N));
     for (int i = 0; i < N; ++i) {
