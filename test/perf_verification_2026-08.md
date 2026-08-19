@@ -1,5 +1,11 @@
 # Performance optimization verification — August 2026
 
+> **See also:** `test/results/graph_vs_matrix_2026-08/README.md` — exactness
+> and performance suite for the matrix-free graph mode (`RACPP_GRAPH_MODE=1`,
+> merged as `b548fce`): byte-identical labels at T=0.2/0.3/0.35/0.4/0.5 on
+> the full 98k set, ~3x faster and ~19x less memory in the production
+> threshold range.
+
 Record of the output-preservation and performance verification for the
 `SymDistBuffer` change (committed as `c469033`) and the dense-init tile
 tuning. All comparisons are **baseline = unmodified source at commit
@@ -112,7 +118,31 @@ diff -q base.txt opt.txt
   immediately, independent of the patch. `--interleave=0,1` only if ever
   running >64 threads across both sockets. (`numactl -H` "free" excludes
   reclaimable cache — check real headroom with `free -g`/`numastat -m`.)
-- Remaining one-time sweeps on prod: thread count (16/32 bound to a socket),
-  `RACPP_DENSE_INIT_TILE` (192/256/384; expect more init gain than on the
-  desktop — the removed serial fill and hugepage/TLB effects grow with the
-  19GB+ matrix, and lower server clocks make serial sections costlier).
+- Prod has **THP=always** (unlike the dev box's madvise), so the no-init/
+  hugepage gains measured on the desktop are mostly already priced in on
+  prod: measured there, the SymDistBuffer change saves ~1.7s init at 98k
+  (fill removal), RAC_i unchanged, peak RSS unchanged (mid-run release
+  still applies).
+- Tile sweep on prod (float32, 98k, 8 threads) INVERTS the desktop result:
+  192 = 15.7s, 256 = 15.0s, 384 = 14.8s, 768 = 14.1-14.2s, 1024 = 14.0s,
+  1536 = 14.1s, 2048 = 14.3s. Plateau at 768-1024; the compiled default
+  (768) is optimal — **set no env var on prod**. The desktop 192 finding
+  was double-precision + small-L3 specific. Worth a one-off re-check if
+  the production thread count changes materially (L3 sharing shifts the
+  optimum), but the curve is flat enough that it is unlikely to matter.
+- Thread/NUMA sweep on prod (98k, 0.35, socket-bound via
+  `numactl --cpunodebind=0 --preferred=0`): T=8 -> 29.8s, T=16 -> 17.9s,
+  T=32 -> 13.0s wall (init 5.3s, dissim 3.2s, nn_dist 3.2s). Binding alone
+  (T=8) recovered ~14% vs unbound. Combined with the SymDistBuffer change:
+  ~36s -> ~13s vs the original unbound 8-thread config, ~2.7x.
+
+**Final prod configuration (2026-08-19):**
+```
+numactl --cpunodebind=<node> --preferred=<same node> <job>   # one socket per job
+no_processors = 32        # physical cores of one socket
+RACPP_DENSE_INIT_TILE     # unset (default 768 optimal on prod)
+```
+For routine >100k batches, two concurrent jobs can be bound to opposite
+sockets for throughput. Untested: T=64 (SMT siblings, expect flat) and the
+serial compaction copy (~1s, now ~7% of wall — next candidate if trimming
+further).
