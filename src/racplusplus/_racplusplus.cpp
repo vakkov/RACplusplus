@@ -3176,6 +3176,294 @@ void RAC_i(
     }
 }
 
+//-----------------Graph mode (exact threshold-graph cosine UPGMA)-----------------
+// Exact UPGMA at a fixed merge threshold T without the O(N^2) distance matrix.
+//
+// For unit-normalized points the average cosine dissimilarity between two
+// clusters is mean(A,B) = 1 - (S_A . S_B) / (|A||B|), where S is the sum of
+// member vectors — so cluster distances never need to be stored, only the
+// per-cluster sums. A mean below T requires at least one point pair below T
+// (a mean cannot be below T if every term is >= T), so the sub-threshold
+// point graph is a complete candidate set for merges. Candidate lists are
+// maintained by concatenation on merge; entries are lazily DSU-resolved,
+// deduplicated, and pruned when their current exact mean is >= T. Pruning is
+// safe: a merged pair's mean is a convex combination of its constituent pair
+// means, so a future sub-T pair always has a sub-T constituent pair that is
+// still listed at merge time.
+//
+// Memory: O(N*D) sums + O(E) edges instead of O(N^2/2) matrix values.
+// Enabled with RACPP_GRAPH_MODE=1; cosine metric only (euclidean average
+// linkage has no closed form). Output is exact UPGMA but not bit-identical
+// to the matrix path: means round differently (double closed form vs
+// incrementally averaged float32 storage), so razor's-edge ties can differ.
+
+static inline bool racpp_graph_mode_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("RACPP_GRAPH_MODE");
+        cached = (env != nullptr && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Read-only DSU find for use inside parallel sections (no path mutation).
+static inline int dsu_find_ro(const std::vector<int>& parent, int x) {
+    while (parent[x] != x) x = parent[x];
+    return x;
+}
+
+template <typename Scalar>
+static std::vector<int> RAC_graph_cosine(
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& base_arr,
+    double max_merge_distance,
+    const int NO_PROCESSORS) {
+
+    const int N = static_cast<int>(base_arr.cols());
+    const int D = static_cast<int>(base_arr.rows());
+    const double T = max_merge_distance;
+    const double inf = std::numeric_limits<double>::infinity();
+    const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(NO_PROCESSORS));
+    // Edge slack absorbs float rounding between the Scalar tile dot products
+    // and the double closed-form means used later; the extra candidates it
+    // admits are pruned by the exact mean test, so correctness is unaffected.
+    const double edge_cut = T + 1e-4;
+
+    const auto t_init0 = std::chrono::high_resolution_clock::now();
+
+    // Per-cluster sum vectors (double), contiguous per cluster id.
+    std::vector<double> sums(static_cast<size_t>(N) * static_cast<size_t>(D));
+    run_parallel_for(n_threads, static_cast<size_t>(N), [&](size_t s, size_t e) {
+        for (size_t i = s; i < e; ++i) {
+            double* dst = sums.data() + i * static_cast<size_t>(D);
+            for (int d0 = 0; d0 < D; ++d0) {
+                dst[d0] = static_cast<double>(
+                    base_arr(d0, static_cast<Eigen::Index>(i)));
+            }
+        }
+    });
+
+    // Phase 1: sub-threshold edge discovery + initial NN via tiled GEMM.
+    // Same tiling as dense init, but nothing is stored except edges < T(+eps).
+    const int TILE = racpp_dense_init_tile_size();
+    const int i_tile_count = (N + TILE - 1) / TILE;
+    const size_t local_slots =
+        std::min(n_threads, static_cast<size_t>(std::max(1, i_tile_count)));
+    std::vector<std::vector<std::pair<int, int>>> edges_locals(local_slots);
+    std::atomic<size_t> slot_counter{0};
+    std::atomic<int> next_i_tile{0};
+
+    const int saved_threads = Eigen::nbThreads();
+    Eigen::setNbThreads(1);
+    run_parallel_for(n_threads, local_slots, [&](size_t start, size_t end) {
+        for (size_t w = start; w < end; ++w) {
+            (void)w;
+            const size_t slot = slot_counter.fetch_add(1, std::memory_order_relaxed);
+            auto& edges = edges_locals[slot];
+            using TileMatrix =
+                Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+            TileMatrix tile;
+            while (true) {
+                const int it = next_i_tile.fetch_add(1, std::memory_order_relaxed);
+                if (it >= i_tile_count) break;
+                const int i_start = it * TILE;
+                const int i_end = std::min(i_start + TILE, N);
+                auto Bi = base_arr.block(0, i_start, D, i_end - i_start);
+                for (int j_start = i_start; j_start < N; j_start += TILE) {
+                    const int j_end = std::min(j_start + TILE, N);
+                    auto Bj = base_arr.block(0, j_start, D, j_end - j_start);
+                    tile.noalias() = Bi.transpose() * Bj;
+                    const int rmax = i_end - i_start;
+                    const int cmax = j_end - j_start;
+                    for (int r = 0; r < rmax; ++r) {
+                        const int i_global = i_start + r;
+                        const int c0 = (j_start == i_start) ? r + 1 : 0;
+                        for (int c = c0; c < cmax; ++c) {
+                            const double dsm = 1.0 - static_cast<double>(tile(r, c));
+                            if (dsm >= edge_cut) continue;
+                            edges.emplace_back(i_global, j_start + c);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Eigen::setNbThreads(saved_threads);
+    base_arr.resize(0, 0);
+
+    // Adjacency lists from per-thread edge buffers (order is irrelevant:
+    // NN evaluation is a min-reduce with smallest-id tie-break).
+    size_t total_edges = 0;
+    for (const auto& el : edges_locals) total_edges += el.size();
+    std::vector<int> deg(static_cast<size_t>(N), 0);
+    for (const auto& el : edges_locals) {
+        for (const auto& e : el) {
+            ++deg[static_cast<size_t>(e.first)];
+            ++deg[static_cast<size_t>(e.second)];
+        }
+    }
+    std::vector<std::vector<int>> lists(static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        lists[static_cast<size_t>(i)].reserve(static_cast<size_t>(deg[i]));
+    }
+    for (auto& el : edges_locals) {
+        for (const auto& e : el) {
+            lists[static_cast<size_t>(e.first)].push_back(e.second);
+            lists[static_cast<size_t>(e.second)].push_back(e.first);
+        }
+        std::vector<std::pair<int, int>>().swap(el);
+    }
+
+    std::vector<Cluster> clusters;
+    clusters.reserve(N);
+    std::vector<int> active_indices(static_cast<size_t>(N));
+    std::iota(active_indices.begin(), active_indices.end(), 0);
+    std::vector<int> active_pos(static_cast<size_t>(N));
+    std::iota(active_pos.begin(), active_pos.end(), 0);
+    for (int i = 0; i < N; ++i) {
+        clusters.emplace_back(i);
+    }
+    std::vector<int> dsu_parent(static_cast<size_t>(N));
+    std::iota(dsu_parent.begin(), dsu_parent.end(), 0);
+    std::vector<int> dsu_size(static_cast<size_t>(N), 1);
+    std::vector<char> alive(static_cast<size_t>(N), 1);
+    std::vector<char> is_changed(static_cast<size_t>(N), 0);
+    std::vector<char> is_dead(static_cast<size_t>(N), 0);
+
+    // Shared NN evaluation kernel: resolve, dedup, prune (mean >= T),
+    // min-reduce with smallest-id tie-break. This is the ONLY arithmetic that
+    // ever produces an NN value — initial NNs use it too, so every pair is
+    // evaluated identically by both endpoints at equal merge state. (Mixing
+    // value systems, e.g. float tile dots at init vs double closed form on
+    // rescans, breaks the guarantee that a reciprocal pair always exists and
+    // can deadlock the merge loop on near-tie duplicate cliques.)
+    std::vector<int> needs_rescan;
+    needs_rescan.reserve(static_cast<size_t>(N));
+    auto recompute_range = [&](size_t start, size_t end) {
+        thread_local std::vector<long long> mark;
+        thread_local long long stamp = 0;
+        if (static_cast<int>(mark.size()) < N) mark.assign(static_cast<size_t>(N), -1);
+        for (size_t q = start; q < end; ++q) {
+            const int cid = needs_rescan[q];
+            std::vector<int>& lst = lists[static_cast<size_t>(cid)];
+            ++stamp;
+            const double sz_x = static_cast<double>(dsu_size[static_cast<size_t>(cid)]);
+            Eigen::Map<const Eigen::VectorXd> sx(
+                sums.data() + static_cast<size_t>(cid) * D, D);
+            double best = inf;
+            int best_idx = -1;
+            size_t wr = 0;
+            for (size_t p = 0; p < lst.size(); ++p) {
+                const int r = dsu_find_ro(dsu_parent, lst[p]);
+                if (r == cid || !alive[static_cast<size_t>(r)]) continue;
+                if (mark[static_cast<size_t>(r)] == stamp) continue;
+                mark[static_cast<size_t>(r)] = stamp;
+                Eigen::Map<const Eigen::VectorXd> sr(
+                    sums.data() + static_cast<size_t>(r) * D, D);
+                const double mean =
+                    1.0 - sx.dot(sr) /
+                              (sz_x * static_cast<double>(dsu_size[static_cast<size_t>(r)]));
+                if (mean < T) {
+                    lst[wr++] = r;
+                    if (mean < best ||
+                        (mean == best && (best_idx == -1 || r < best_idx))) {
+                        best = mean;
+                        best_idx = r;
+                    }
+                }
+            }
+            lst.resize(wr);
+            clusters[static_cast<size_t>(cid)].nn = best_idx;
+            clusters[static_cast<size_t>(cid)].nn_distance =
+                (best_idx != -1) ? best : inf;
+        }
+    };
+
+    // Initial NN pass over every point that has edges, using the kernel.
+    for (int i = 0; i < N; ++i) {
+        if (!lists[static_cast<size_t>(i)].empty()) needs_rescan.push_back(i);
+    }
+    run_parallel_for(n_threads, needs_rescan.size(), recompute_range);
+
+    const auto t_init1 = std::chrono::high_resolution_clock::now();
+    std::cout << "Graph init: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t_init1 - t_init0).count()
+              << "ms | edges=" << total_edges
+              << " | avg_deg=" << (N > 0 ? 2.0 * total_edges / N : 0.0) << std::endl;
+
+    // Merge loop.
+    long total_merge_ms = 0, total_nn_ms = 0, total_find_ms = 0;
+    int iterations = 0;
+
+    std::vector<std::pair<int, int>> merges = find_reciprocal_nn(clusters, active_indices);
+    while (!merges.empty()) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        // Apply all merges of the round (serial, deterministic order).
+        for (const auto& m : merges) {
+            const int main_id = m.first;
+            const int sec_id = m.second;
+            Eigen::Map<Eigen::VectorXd>(
+                sums.data() + static_cast<size_t>(main_id) * D, D) +=
+                Eigen::Map<const Eigen::VectorXd>(
+                    sums.data() + static_cast<size_t>(sec_id) * D, D);
+            auto& lm = lists[static_cast<size_t>(main_id)];
+            auto& ls = lists[static_cast<size_t>(sec_id)];
+            lm.insert(lm.end(), ls.begin(), ls.end());
+            std::vector<int>().swap(ls);
+            dsu_union(dsu_parent, dsu_size, main_id, sec_id);
+            is_changed[static_cast<size_t>(main_id)] = 1;
+            is_dead[static_cast<size_t>(sec_id)] = 1;
+        }
+
+        // Rescan set: merged mains, plus bystanders whose NN was merged
+        // (reducibility: any other cluster's NN is unaffected).
+        needs_rescan.clear();
+        for (int idx : active_indices) {
+            if (is_dead[static_cast<size_t>(idx)]) continue;
+            if (is_changed[static_cast<size_t>(idx)]) {
+                needs_rescan.push_back(idx);
+                continue;
+            }
+            const int onn = clusters[static_cast<size_t>(idx)].nn;
+            if (onn != -1 &&
+                (is_dead[static_cast<size_t>(onn)] || is_changed[static_cast<size_t>(onn)])) {
+                needs_rescan.push_back(idx);
+            }
+        }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+
+        // Recompute NNs with the shared kernel.
+        run_parallel_for(n_threads, needs_rescan.size(), recompute_range);
+        const auto t2 = std::chrono::high_resolution_clock::now();
+
+        remove_secondary_clusters(merges, clusters, active_indices, active_pos);
+        for (const auto& m : merges) {
+            alive[static_cast<size_t>(m.second)] = 0;
+            is_changed[static_cast<size_t>(m.first)] = 0;
+            is_dead[static_cast<size_t>(m.second)] = 0;
+        }
+
+        merges = find_reciprocal_nn(clusters, active_indices);
+        const auto t3 = std::chrono::high_resolution_clock::now();
+
+        total_merge_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        total_nn_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        total_find_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        ++iterations;
+    }
+
+    std::cerr << "RAC_graph iterations: " << iterations
+              << " | merge+build: " << total_merge_ms << "ms"
+              << " | nn_recompute: " << total_nn_ms << "ms"
+              << " | find+remove: " << total_find_ms << "ms" << std::endl;
+
+    std::vector<int> cluster_labels(static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        cluster_labels[static_cast<size_t>(i)] = dsu_find(dsu_parent, i);
+    }
+    return cluster_labels;
+}
+//-----------------End Graph mode-----------------
+
 template <typename Scalar>
 static std::vector<int> RAC_impl_no_connectivity(
     Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& base_arr,
@@ -3186,6 +3474,11 @@ static std::vector<int> RAC_impl_no_connectivity(
     const int NO_PROCESSORS = (no_processors != 0) ? no_processors : getProcessorCount();
     const int N = static_cast<int>(base_arr.cols());
     Eigen::setNbThreads(NO_PROCESSORS);
+
+    // Opt-in matrix-free path (RACPP_GRAPH_MODE=1); cosine only.
+    if (racpp_graph_mode_enabled() && distance_metric == "cosine") {
+        return RAC_graph_cosine(base_arr, max_merge_distance, NO_PROCESSORS);
+    }
 
     std::vector<Cluster> clusters;
     clusters.reserve(N);
