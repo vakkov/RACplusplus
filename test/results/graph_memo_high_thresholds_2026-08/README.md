@@ -70,6 +70,28 @@ avg degree 29-80) the memo makes the merge loop essentially free (<1s) and
 graph mode is ~3x faster than matrix at 19x less memory. Past avg degree
 ~1000, use matrix mode if it fits in RAM, graph mode if it does not.
 
+## Production validation (2026-08-20, dual EPYC 7513, 32 threads socket-bound)
+
+Run on PRD-01-GPU-01 with `numactl --cpunodebind=0 --preferred=0`, same 98k
+embedding file. Exactness: **all three implementations byte-identical at
+T=0.35 / 0.5 / 0.6** (38,443 / 15,420 / 5,500 clusters — matching the dev
+results exactly).
+
+| T | matrix | plain graph | memo graph | best |
+|-----|--------------|--------------|--------------|------|
+| 0.35 | 12.8-13.2s / 19.4GB | 6.1-6.4s / 1.03GB | **5.8s / 1.04GB** | memo |
+| 0.5 | 14.0-14.4s / 19.4GB | 11.8s / 1.15GB | **9.9-10.1s / 1.35GB** | memo |
+| 0.6 | **14.3-14.5s / 19.4GB** | 49.3-49.7s / 1.8GB | 32.4-32.8s / 3.7GB | matrix |
+
+The EPYC's 8-channel bandwidth flatters matrix mode at high T (its 0.6 run is
+2.4x faster than on the desktop), so the time crossover lands at ~T=0.5 there
+vs ~T=0.55-0.6 on the desktop. The memo beat plain graph at every threshold
+on both machines.
+
+**Service routing (adopted):** `RACPP_GRAPH_MODE=1` for jobs with T <= 0.5;
+unset (matrix) for T >= 0.6 while N x N/2 x 4B fits node RAM. Both routes are
+output-identical, so routing is purely operational.
+
 ## Reproduce
 
 ```bash
